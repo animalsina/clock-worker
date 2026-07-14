@@ -42,7 +42,7 @@ Promemoria pause per Ubuntu/Wayland, pensato per chi lavora molte ore al PC.
 - La finestra **Attività e tempi** è sempre consultabile dal menu dell’icona o dalla finestra di controllo e permette di scorrere i giorni. Mostra anche i totali settimanali e mensili e il riporto del mese precedente.
 - Da **Attività e tempi** puoi aggiungere manualmente nuove righe, modificare progetto, attività e durata, oppure eliminare una voce; i totali giornalieri vengono aggiornati automaticamente.
 - Anche **Tempo precedente non classificato** è modificabile: lasciando vuota l’attività puoi correggerne soltanto la durata, compilando progetto e attività puoi classificarlo, oppure puoi eliminarlo e sottrarlo dal totale giornaliero.
-- Il pulsante **Mostra Markdown** genera il riepilogo del giorno selezionato con titolo nel formato `02 dic 2026`, pronto da modificare e copiare negli appunti.
+- **Mostra Markdown** è disponibile sia nella finestra **Attività e tempi** sia direttamente dal menu dell’icona; genera il riepilogo del giorno con titolo nel formato `02 dic 2026`, pronto da modificare e copiare negli appunti.
 - Conserva attività, progetti e straordinari per 24 mesi. I progetti già usati vengono proposti con ricerca rapida.
 - Il comando **Resetta e comincia adesso** annulla pausa, ultimatum o attese e riporta subito il timer al valore completo configurato.
 - Se chiudi e riapri il programma nella stessa fascia e nello stesso giorno, riprende esattamente dal punto interrotto: tempo di lavoro, ultimatum, pausa, attesa di rientro, progetto e attività corrente.
@@ -94,7 +94,8 @@ Puoi modificare:
 - ricorrenza annuale automatica per le date personalizzate che devono valere anche negli anni successivi;
 - audio on/off;
 - volume beep;
-- numero beep e distanza in secondi.
+- numero beep e distanza in secondi;
+- inclusione facoltativa del tempo impiegato accanto a ogni task nel riepilogo Markdown, disattivata per impostazione predefinita.
 
 Il file delle impostazioni è qui:
 
@@ -134,7 +135,7 @@ Quando il pannello supporta le etichette AppIndicator, accanto all’icona vengo
 
 Accanto allo stato viene mostrato anche il tempo ancora necessario per completare l’obiettivo giornaliero, per esempio `52m · 6h30 da fare`. Nelle giornate lavorative straordinarie viene invece mostrato il totale `EXTRA` già accumulato.
 
-Dal menu dell’icona sono disponibili anche **Cosa stai facendo adesso?**, **Resetta e comincia adesso**, **Avvia pausa adesso**, **Attività e tempi** e **Ferie, festività e giornate EXTRA**. Durante la compensazione post chiusura compare inoltre **Concludi definitivamente adesso**.
+Dal menu dell’icona sono disponibili anche **Cosa stai facendo adesso?**, **Resetta e comincia adesso**, **Avvia pausa adesso**, **Attività e tempi**, **Mostra Markdown** e **Ferie, festività e giornate EXTRA**. Durante la compensazione post chiusura compare inoltre **Concludi definitivamente adesso**.
 
 ## Scorciatoie globali
 
@@ -184,16 +185,16 @@ Da questa finestra puoi inoltre:
 - modificare una riga con doppio clic o con **Modifica selezionata**;
 - correggere, classificare o eliminare **Tempo precedente non classificato**;
 - eliminare una voce e sottrarre automaticamente il relativo tempo dal totale;
-- generare il riepilogo Markdown del giorno aperto e copiarlo negli appunti;
+- generare il riepilogo Markdown del giorno aperto e copiarlo negli appunti; lo stesso comando è disponibile direttamente dal menu dell’icona per la giornata corrente;
 - aprire **Straordinari ed EXTRA del mese**, con dettaglio giornaliero, distinzione tra oltre fascia, limite settimanale e festività/ferie, totale mensile e riporto del mese precedente.
 
-Esempio di esportazione:
+Esempio di esportazione con i tempi per task disattivati, come da impostazione predefinita:
 
 ```markdown
 # 02 dic 2026
 
 - **MyWork**
-  - Correzione profilo utente — 1 h 20 min
+  - Correzione profilo utente
 
 - **Totale lavoro:** 1 h 20 min
 - **Totale pause:** 10 min
@@ -205,6 +206,8 @@ Esempio di esportazione:
 - **EXTRA dicembre 2026:** 3 h 10 min
 - **EXTRA riportato dal mese precedente (novembre 2026):** 1 h 15 min
 ```
+
+Attivando **Mostra il tempo impiegato per ogni task nel Markdown** nelle impostazioni, le attività vengono invece mostrate nel formato `Correzione profilo utente — 1 h 20 min`.
 
 ## Ferie, festività e giornate lavorative EXTRA
 

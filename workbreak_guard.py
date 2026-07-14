@@ -110,6 +110,7 @@ class Settings:
     show_clock_last_minutes: int = 5
     clock_enabled: bool = True
     indicator_label_enabled: bool = True
+    markdown_include_task_times: bool = False
     clock_opacity_low: float = 0.22
     clock_opacity_high: float = 0.72
     launch_minimized: bool = True
@@ -940,13 +941,17 @@ class ActivityEntryDialog(Gtk.Dialog):
 
 
 class MarkdownPreviewWindow(Gtk.Window):
-    def __init__(self, parent: Gtk.Window, markdown_text: str):
+    def __init__(self, parent: Optional[Gtk.Window], markdown_text: str):
         super().__init__(title="Riepilogo Markdown")
         self.markdown_text = markdown_text
-        self.set_transient_for(parent)
-        self.set_modal(True)
+        if parent is not None:
+            self.set_transient_for(parent)
+            self.set_modal(True)
+            self.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        else:
+            self.set_modal(False)
+            self.set_position(Gtk.WindowPosition.CENTER)
         self.set_default_size(720, 560)
-        self.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
         self.set_border_width(16)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -2041,6 +2046,13 @@ class SettingsWindow(Gtk.Window):
         holidays_box.pack_end(holidays_button, False, False, 0)
         row = self._labeled(grid, row, "Calendario e giornate EXTRA", holidays_box)
 
+        self.markdown_include_task_times = Gtk.CheckButton(
+            label="Mostra il tempo impiegato per ogni task nel Markdown"
+        )
+        self.markdown_include_task_times.set_active(app.settings.markdown_include_task_times)
+        grid.attach(self.markdown_include_task_times, 0, row, 2, 1)
+        row += 1
+
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         outer.pack_start(controls, False, False, 0)
 
@@ -2090,6 +2102,7 @@ class SettingsWindow(Gtk.Window):
         s.warning_seconds = int(self.warning_seconds.get_value())
         s.overtime_reminder_minutes = int(self.overtime_reminder_minutes.get_value())
         s.extra_closure_day = int(self.extra_closure_day.get_value())
+        s.markdown_include_task_times = self.markdown_include_task_times.get_active()
         try:
             s.extra_closure_weekday = int(self.extra_closure_weekday.get_active_id() or 0)
         except Exception:
@@ -2202,6 +2215,7 @@ class WorkBreakApp:
         self.session_window: Optional[ActivityPromptWindow] = None
         self.activity_window: Optional[ActivityPromptWindow] = None
         self.summary_window: Optional[ActivitySummaryWindow] = None
+        self.day_markdown_window: Optional[MarkdownPreviewWindow] = None
         self.day_off_window: Optional[DayOffManagerWindow] = None
         self.session_end_window: Optional[ChoiceAlertWindow] = None
         self.midday_recovery_window: Optional[MiddayRecoveryWindow] = None
@@ -2308,6 +2322,10 @@ class WorkBreakApp:
         summary = Gtk.MenuItem(label="Attività e tempi")
         summary.connect("activate", lambda *_: self.show_activity_summary())
         menu.append(summary)
+
+        markdown_item = Gtk.MenuItem(label="Mostra Markdown")
+        markdown_item.connect("activate", lambda *_: self.show_day_markdown())
+        menu.append(markdown_item)
 
         day_offs = Gtk.MenuItem(label="Ferie, festività e giornate EXTRA")
         day_offs.connect("activate", lambda *_: self.show_day_off_manager())
@@ -2436,6 +2454,20 @@ class WorkBreakApp:
             self.summary_window.present()
             return
         self.summary_window = ActivitySummaryWindow(self, selected_day)
+
+    def show_day_markdown(self, day: Optional[dt.date] = None) -> None:
+        selected_day = day or dt.date.today()
+        markdown_text = self.build_day_markdown(selected_day)
+        if self.day_markdown_window and self.day_markdown_window.get_visible():
+            self.day_markdown_window.destroy()
+        parent: Optional[Gtk.Window] = None
+        if self.summary_window and self.summary_window.get_visible():
+            parent = self.summary_window
+        elif self.control_window and self.control_window.get_visible():
+            parent = self.control_window
+        elif self.settings_window and self.settings_window.get_visible():
+            parent = self.settings_window
+        self.day_markdown_window = MarkdownPreviewWindow(parent, markdown_text)
 
     def toggle_enabled(self) -> None:
         self.settings.enabled = not self.settings.enabled
@@ -4504,10 +4536,14 @@ class WorkBreakApp:
                 lines.append(f"- **{self._markdown_escape(project)}**")
                 for item in items:
                     activity = str(item.get("text", "")).strip() or "Tempo non classificato"
-                    duration = self._format_effective_minutes(int(item.get("work_seconds", 0)))
-                    lines.append(
-                        f"  - {self._markdown_escape(activity)} — {self._markdown_escape(duration)}"
-                    )
+                    if self.settings.markdown_include_task_times:
+                        duration = self._format_effective_minutes(int(item.get("work_seconds", 0)))
+                        lines.append(
+                            f"  - {self._markdown_escape(activity)} — "
+                            f"{self._markdown_escape(duration)}"
+                        )
+                    else:
+                        lines.append(f"  - {self._markdown_escape(activity)}")
         else:
             lines.append("- Nessuna attività registrata.")
 
