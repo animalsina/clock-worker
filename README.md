@@ -192,7 +192,7 @@ Esempio di esportazione:
 ```markdown
 # 02 dic 2026
 
-- **MyQuadra**
+- **MyWork**
   - Correzione profilo utente — 1 h 20 min
 
 - **Totale lavoro:** 1 h 20 min
