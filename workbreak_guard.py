@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Giuseppe Mazzullo <info@animalsina.work>
+# Licensed under the PolyForm Noncommercial License 1.0.0. See LICENSE.
 """
 WorkBreak Guard - promemoria pausa per Ubuntu/Wayland.
 
@@ -21,6 +23,8 @@ Funzioni principali:
 - Chiude mensilmente il saldo positivo nel primo giorno della settimana configurato dopo il giorno base.
 - Permette di lavorare su festività/ferie/giorni esclusi classificando quelle ore come EXTRA.
 - Può azzerare il ciclo e ripartire subito dal tempo completo configurato.
+- Permette di iniziare manualmente prima della fascia, sospendere e riprendere la giornata, oppure terminarla in anticipo.
+- Supporta pause manuali a durata definita o senza scadenza, registrate ma non accreditate nell’obiettivo giornaliero.
 - Ripristina fase, tempo residuo, progetto e attività dopo la chiusura nella stessa fascia.
 - Gestisce il lavoro oltre la fine fascia con conferma, promemoria periodici e recupero della pausa mattutina.
 - Calcola festività nazionali, patroni di Este/Firenze e ferie o ricorrenze personalizzate.
@@ -82,6 +86,14 @@ PID_FILE = CONFIG_DIR / "app.pid"
 AUTOSTART_DIR = Path.home() / ".config" / "autostart"
 AUTOSTART_FILE = AUTOSTART_DIR / f"{APP_ID}.desktop"
 SESSION_END_INACTIVITY_SECONDS = 20 * 60
+REGULAR_PAUSE_WORK_BLOCK_SECONDS = 2 * 60 * 60
+
+TIMER_END_SOUND_OPTIONS = {
+    "none": "Nessun suono",
+    "soft": "Beep morbido",
+    "double": "Doppio beep",
+    "chime": "Campanello",
+}
 
 
 @dataclass
@@ -89,6 +101,8 @@ class Settings:
     enabled: bool = True
     work_minutes: int = 60
     break_minutes: int = 5
+    regular_pause_credit_minutes: int = 10
+    daily_pause_extra_credit_minutes: int = 20
     daily_target_hours: int = 8
     warning_seconds: int = 60
     overtime_reminder_minutes: int = 10
@@ -104,6 +118,7 @@ class Settings:
     custom_holidays: list[str] = field(default_factory=list)  # compatibilità: YYYY-MM-DD
     custom_days_off: list[dict] = field(default_factory=list)
     audio_enabled: bool = True
+    timer_end_sound: str = "soft"
     beep_volume: float = 0.10  # ampiezza wav, volutamente bassa
     beep_count: int = 5
     beep_interval_seconds: int = 20
@@ -143,12 +158,21 @@ class Settings:
     def sanitize(self) -> None:
         self.work_minutes = clamp_int(self.work_minutes, 5, 240)
         self.break_minutes = clamp_int(self.break_minutes, 1, 60)
+        self.regular_pause_credit_minutes = clamp_int(
+            self.regular_pause_credit_minutes, 0, 60
+        )
+        self.daily_pause_extra_credit_minutes = clamp_int(
+            self.daily_pause_extra_credit_minutes, 0, 240
+        )
         self.daily_target_hours = clamp_int(self.daily_target_hours, 1, 24)
         self.warning_seconds = clamp_int(self.warning_seconds, 5, 600)
         self.overtime_reminder_minutes = clamp_int(self.overtime_reminder_minutes, 1, 120)
         self.extra_closure_day = clamp_int(self.extra_closure_day, 1, 28)
         self.extra_closure_weekday = clamp_int(self.extra_closure_weekday, 0, 6)
         self.show_clock_last_minutes = clamp_int(self.show_clock_last_minutes, 0, 60)
+        self.timer_end_sound = str(self.timer_end_sound or "soft")
+        if self.timer_end_sound not in TIMER_END_SOUND_OPTIONS:
+            self.timer_end_sound = "soft"
         self.beep_count = clamp_int(self.beep_count, 0, 20)
         self.beep_interval_seconds = clamp_int(self.beep_interval_seconds, 5, 300)
         self.beep_volume = max(0.0, min(float(self.beep_volume), 0.30))
@@ -406,6 +430,11 @@ def format_mmss(seconds: int) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+def format_negative_countdown(seconds: int) -> str:
+    """Formatta un tempo trascorso come countdown negativo, es. -05:30."""
+    return f"-{format_mmss(seconds)}"
+
+
 def format_signed_hours_minutes(seconds: int, always_sign: bool = True) -> str:
     seconds = int(seconds)
     sign = "+" if seconds >= 0 else "−"
@@ -525,6 +554,15 @@ rgba(
         font-weight: 700;
     }
     .wb-countdown { font-size: 64px; font-weight: 900; }
+    .wb-summary-card {
+        background: alpha(@theme_fg_color, 0.055);
+        border: 1px solid alpha(@theme_fg_color, 0.12);
+        border-radius: 12px;
+        padding: 12px;
+    }
+    .wb-summary-value { font-size: 22px; font-weight: 800; }
+    .wb-summary-caption { font-size: 12px; opacity: 0.72; }
+    .wb-chart-title { font-size: 18px; font-weight: 800; }
     .wb-danger { color: #ff8a80; }
     .wb-ok { color: #b9f6ca; }
     """
@@ -540,8 +578,9 @@ class AlertWindow(Gtk.Window):
         self.set_keep_above(True)
         self.set_decorated(False)
         self.set_skip_taskbar_hint(True)
-        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
-        self.connect("key-press-event", self._on_key)
+        self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         outer.set_border_width(24)
@@ -562,12 +601,22 @@ class AlertWindow(Gtk.Window):
 
         button = Gtk.Button(label=button_text)
         button.set_size_request(220, 48)
+        button.set_can_focus(False)
+        button.set_sensitive(False)
         button.connect("clicked", self._clicked)
         outer.pack_start(button, False, False, 0)
+        GLib.timeout_add(800, self._enable_button_safely, button)
 
         self.show_all()
-        place_on_active_monitor(self, 520, 220)
-        self.present()
+        place_on_active_monitor_top_right(self, 520, 220)
+
+    @staticmethod
+    def _enable_button_safely(button: Gtk.Button) -> bool:
+        try:
+            button.set_sensitive(True)
+        except Exception:
+            pass
+        return False
 
     def _clicked(self, *_args) -> None:
         if self.on_click:
@@ -583,12 +632,12 @@ class AlertWindow(Gtk.Window):
 
 
 
-def place_on_active_monitor(window: Gtk.Window, width: int, height: int) -> None:
-    """Centra la finestra sul monitor in cui si trova il puntatore."""
+def active_monitor_geometry():
+    """Restituisce la geometria del monitor in cui si trova il puntatore."""
     try:
         display = Gdk.Display.get_default()
         if not display:
-            return
+            return None
         monitor = None
         seat = display.get_default_seat()
         pointer = seat.get_pointer() if seat else None
@@ -597,11 +646,37 @@ def place_on_active_monitor(window: Gtk.Window, width: int, height: int) -> None
             if hasattr(display, "get_monitor_at_point"):
                 monitor = display.get_monitor_at_point(x, y)
         monitor = monitor or display.get_primary_monitor() or display.get_monitor(0)
-        if not monitor:
+        return monitor.get_geometry() if monitor else None
+    except Exception:
+        return None
+
+
+def place_on_active_monitor(window: Gtk.Window, width: int, height: int) -> None:
+    """Centra la finestra sul monitor in cui si trova il puntatore."""
+    try:
+        geo = active_monitor_geometry()
+        if not geo:
             return
-        geo = monitor.get_geometry()
         window.resize(width, height)
         window.move(geo.x + max(0, (geo.width - width) // 2), geo.y + max(0, (geo.height - height) // 2))
+    except Exception:
+        # Su Wayland il compositor può ignorare il posizionamento esplicito.
+        pass
+
+
+def place_on_active_monitor_top_right(
+    window: Gtk.Window, width: int, height: int, margin: int = 24
+) -> None:
+    """Posiziona un avviso in alto a destra senza coprire il centro del lavoro."""
+    try:
+        geo = active_monitor_geometry()
+        if not geo:
+            return
+        window.resize(width, height)
+        window.move(
+            geo.x + max(0, geo.width - width - margin),
+            geo.y + max(0, margin),
+        )
     except Exception:
         # Su Wayland il compositor può ignorare il posizionamento esplicito.
         pass
@@ -616,13 +691,15 @@ class ChoiceAlertWindow(Gtk.Window):
     ):
         super().__init__(title=title)
         self.choices = choices
-        self.set_default_size(620, 250)
+        self.window_width = 820 if len(choices) >= 4 else 620
+        self.set_default_size(self.window_width, 250)
         self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
         self.set_keep_above(True)
         self.set_decorated(False)
         self.set_skip_taskbar_hint(True)
-        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
-        self.connect("key-press-event", self._on_key)
+        self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         outer.set_border_width(24)
@@ -647,12 +724,22 @@ class ChoiceAlertWindow(Gtk.Window):
         for label, callback in choices:
             button = Gtk.Button(label=label)
             button.set_size_request(170, 48)
+            button.set_can_focus(False)
+            button.set_sensitive(False)
             button.connect("clicked", self._clicked, callback)
             row.pack_start(button, True, True, 0)
+            GLib.timeout_add(800, self._enable_button_safely, button)
 
         self.show_all()
-        place_on_active_monitor(self, 620, 250)
-        self.present()
+        place_on_active_monitor_top_right(self, self.window_width, 250)
+
+    @staticmethod
+    def _enable_button_safely(button: Gtk.Button) -> bool:
+        try:
+            button.set_sensitive(True)
+        except Exception:
+            pass
+        return False
 
     def _clicked(self, _button: Gtk.Button, callback: Callable[[], None]) -> None:
         self.destroy()
@@ -663,6 +750,184 @@ class ChoiceAlertWindow(Gtk.Window):
             self.destroy()
             self.choices[0][1]()
             return True
+        return False
+
+
+class ManualPauseWindow(Gtk.Window):
+    def __init__(self, app: "WorkBreakApp"):
+        super().__init__(title="Pausa manuale")
+        self.app = app
+        self.set_default_size(620, 330)
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+        self.set_keep_above(True)
+        self.set_decorated(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        outer.set_border_width(24)
+        outer.get_style_context().add_class("wb-card")
+        self.add(outer)
+
+        title = Gtk.Label(label="Quanto deve durare la pausa?")
+        title.get_style_context().add_class("wb-title")
+        title.set_line_wrap(True)
+        title.set_justify(Gtk.Justification.CENTER)
+        outer.pack_start(title, False, False, 0)
+
+        message = Gtk.Label(
+            label=(
+                "La pausa manuale viene registrata come pausa effettiva, ma non viene "
+                "conteggiata nelle ore di lavoro giornaliere. Puoi scegliere una durata "
+                "oppure lasciarla senza scadenza e riprendere quando vuoi."
+            )
+        )
+        message.get_style_context().add_class("wb-body")
+        message.set_line_wrap(True)
+        message.set_justify(Gtk.Justification.CENTER)
+        outer.pack_start(message, False, False, 0)
+
+        quick = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        quick.set_homogeneous(True)
+        outer.pack_start(quick, False, False, 0)
+        for minutes in (5, 10, 15, 30, 60):
+            button = Gtk.Button(label=f"{minutes} min")
+            button.connect("clicked", lambda _button, value=minutes: self._start(value))
+            quick.pack_start(button, True, True, 0)
+
+        custom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        outer.pack_start(custom, False, False, 0)
+        custom.pack_start(Gtk.Label(label="Durata personalizzata:"), False, False, 0)
+        self.minutes = Gtk.SpinButton.new_with_range(1, 720, 1)
+        self.minutes.set_value(20)
+        custom.pack_start(self.minutes, False, False, 0)
+        custom.pack_start(Gtk.Label(label="minuti"), False, False, 0)
+        start_custom = Gtk.Button(label="Avvia pausa")
+        start_custom.connect("clicked", lambda *_: self._start(int(self.minutes.get_value())))
+        custom.pack_end(start_custom, False, False, 0)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        actions.set_homogeneous(True)
+        outer.pack_start(actions, False, False, 0)
+        indefinite = Gtk.Button(label="Pausa senza scadenza")
+        indefinite.connect("clicked", lambda *_: self._start(None))
+        actions.pack_start(indefinite, True, True, 0)
+        cancel = Gtk.Button(label="Annulla")
+        cancel.connect("clicked", lambda *_: self._cancel())
+        actions.pack_start(cancel, True, True, 0)
+
+        self.connect("delete-event", self._on_delete)
+        self.show_all()
+        place_on_active_monitor(self, 620, 330)
+        self.present()
+
+    def _start(self, minutes: Optional[int]) -> None:
+        self.app.manual_pause_window = None
+        self.destroy()
+        self.app.start_manual_break(minutes)
+
+    def _cancel(self) -> None:
+        self.app.manual_pause_window = None
+        self.destroy()
+
+    def _on_delete(self, *_args) -> bool:
+        self.app.manual_pause_window = None
+        return False
+
+
+class RegularPauseWindow(Gtk.Window):
+    """Scelta della durata per la pausa ciclica accreditabile nell’obiettivo."""
+
+    def __init__(self, app: "WorkBreakApp"):
+        super().__init__(title="Durata della pausa")
+        self.app = app
+        self.set_default_size(650, 330)
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+        self.set_keep_above(True)
+        self.set_decorated(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        outer.set_border_width(24)
+        outer.get_style_context().add_class("wb-card")
+        self.add(outer)
+
+        title = Gtk.Label(label="Quanto deve durare la pausa?")
+        title.get_style_context().add_class("wb-title")
+        title.set_line_wrap(True)
+        title.set_justify(Gtk.Justification.CENTER)
+        outer.pack_start(title, False, False, 0)
+
+        day = app.current_session_date or dt.date.today()
+        available = app.regular_pause_credit_available_seconds(day)
+        credit_minutes = max(0, int(app.settings.regular_pause_credit_minutes))
+        extra_minutes = max(0, int(app.settings.daily_pause_extra_credit_minutes))
+        if credit_minutes > 0:
+            credit_explanation = (
+                f"Ogni pausa può abbuonare fino a {credit_minutes} minuti. "
+                f"La giornata matura {credit_minutes} minuti ogni 2 ore lavorate "
+                f"più {extra_minutes} minuti di tolleranza giornaliera: soltanto "
+                "la parte oltre il tetto complessivo sarà da recuperare."
+            )
+        else:
+            credit_explanation = (
+                "Nelle impostazioni la pausa abbuonata per singola pausa è disattivata: "
+                "tutta la durata scelta resterà una pausa reale da recuperare."
+            )
+        message = Gtk.Label(
+            label=(
+                "La pausa parte nel momento in cui scegli una durata. "
+                f"{credit_explanation}\n"
+                f"Quota ancora disponibile oggi: {app._format_effective_minutes(available)}."
+            )
+        )
+        message.get_style_context().add_class("wb-body")
+        message.set_line_wrap(True)
+        message.set_justify(Gtk.Justification.CENTER)
+        outer.pack_start(message, False, False, 0)
+
+        quick = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        quick.set_homogeneous(True)
+        outer.pack_start(quick, False, False, 0)
+        for minutes in (5, 10, 15):
+            button = Gtk.Button(label=f"{minutes} minuti")
+            button.connect("clicked", lambda _button, value=minutes: self._start(value))
+            quick.pack_start(button, True, True, 0)
+
+        custom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        outer.pack_start(custom, False, False, 0)
+        custom.pack_start(Gtk.Label(label="Durata personalizzata:"), False, False, 0)
+        self.minutes = Gtk.SpinButton.new_with_range(1, 720, 1)
+        self.minutes.set_value(max(1, int(app.settings.break_minutes)))
+        custom.pack_start(self.minutes, False, False, 0)
+        custom.pack_start(Gtk.Label(label="minuti"), False, False, 0)
+        start_custom = Gtk.Button(label="Avvia pausa personalizzata")
+        start_custom.connect("clicked", lambda *_: self._start(int(self.minutes.get_value())))
+        custom.pack_end(start_custom, False, False, 0)
+
+        cancel = Gtk.Button(label="Annulla")
+        cancel.connect("clicked", lambda *_: self._cancel())
+        outer.pack_start(cancel, False, False, 0)
+
+        self.connect("delete-event", self._on_delete)
+        self.show_all()
+        place_on_active_monitor(self, 650, 330)
+        self.present()
+
+    def _start(self, minutes: int) -> None:
+        self.app.regular_pause_window = None
+        self.destroy()
+        self.app._begin_regular_break(minutes)
+
+    def _cancel(self) -> None:
+        self.app.regular_pause_window = None
+        self.destroy()
+        self.app._cancel_regular_pause_choice()
+
+    def _on_delete(self, *_args) -> bool:
+        self.app.regular_pause_window = None
+        GLib.idle_add(self.app._cancel_regular_pause_choice)
         return False
 
 
@@ -677,6 +942,7 @@ class ActivityPromptWindow(Gtk.Window):
         on_activity: Callable[[str, str], None],
         on_later: Optional[Callable[[], None]] = None,
         activity_question: str = "Cosa stai facendo adesso?",
+        info_lines: Optional[list[str]] = None,
     ):
         super().__init__(title=title)
         self.current_activity = current_activity.strip()
@@ -685,7 +951,7 @@ class ActivityPromptWindow(Gtk.Window):
         self.on_activity = on_activity
         self.on_later = on_later
         self.activity_question = activity_question
-        self.set_default_size(700, 500)
+        self.set_default_size(700, 610 if info_lines else 500)
         self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
         self.set_keep_above(True)
         self.set_decorated(False)
@@ -702,6 +968,12 @@ class ActivityPromptWindow(Gtk.Window):
         title_label.set_line_wrap(True)
         title_label.set_justify(Gtk.Justification.CENTER)
         outer.pack_start(title_label, False, False, 0)
+
+        self.info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        self.info_box.set_margin_top(2)
+        self.info_box.set_margin_bottom(4)
+        outer.pack_start(self.info_box, False, False, 0)
+        self.update_info_lines(info_lines or [])
 
         if self.current_activity:
             current_label = self._display_activity(self.current_project, self.current_activity)
@@ -789,9 +1061,31 @@ class ActivityPromptWindow(Gtk.Window):
             buttons.pack_start(later_button, False, False, 0)
 
         self.show_all()
-        place_on_active_monitor(self, 700, 500)
+        place_on_active_monitor(self, 700, 610 if info_lines else 500)
         self.present()
         self.entry.grab_focus()
+
+    def update_info_lines(self, lines: list[str]) -> None:
+        """Aggiorna il riquadro informativo senza ricreare la finestra."""
+        for child in self.info_box.get_children():
+            self.info_box.remove(child)
+        if not lines:
+            self.info_box.set_no_show_all(True)
+            self.info_box.hide()
+            return
+
+        self.info_box.set_no_show_all(False)
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        self.info_box.pack_start(separator, False, False, 2)
+        for index, text in enumerate(lines):
+            label = Gtk.Label(label=text)
+            label.set_xalign(0)
+            label.set_line_wrap(True)
+            label.set_selectable(True)
+            if index >= max(0, len(lines) - 2):
+                label.get_style_context().add_class("wb-body")
+            self.info_box.pack_start(label, False, False, 0)
+        self.info_box.show_all()
 
     @staticmethod
     def _display_activity(project: str, activity: str) -> str:
@@ -1005,13 +1299,365 @@ class MarkdownPreviewWindow(Gtk.Window):
         return False
 
 
+class DayChartView(Gtk.ScrolledWindow):
+    """Dashboard grafica del riepilogo giornaliero, senza dipendenze esterne."""
+
+    def __init__(self, app: "WorkBreakApp", day: dt.date):
+        super().__init__()
+        self.app = app
+        self.day = day
+        self.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+
+        viewport = Gtk.Viewport()
+        viewport.set_shadow_type(Gtk.ShadowType.NONE)
+        self.add(viewport)
+
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.content.set_border_width(16)
+        viewport.add(self.content)
+        self.refresh()
+
+    def _clear(self) -> None:
+        for child in self.content.get_children():
+            child.destroy()
+
+    @staticmethod
+    def _duration(app: "WorkBreakApp", seconds: int) -> str:
+        return app._format_effective_minutes(max(0, int(seconds)))
+
+    @staticmethod
+    def _signed_duration(seconds: int) -> str:
+        return format_signed_hours_minutes(int(seconds))
+
+    def _section_title(self, text: str, subtitle: str = "") -> None:
+        title = Gtk.Label(label=text)
+        title.set_xalign(0)
+        title.get_style_context().add_class("wb-chart-title")
+        self.content.pack_start(title, False, False, 0)
+        if subtitle:
+            detail = Gtk.Label(label=subtitle)
+            detail.set_xalign(0)
+            detail.set_line_wrap(True)
+            detail.get_style_context().add_class("wb-summary-caption")
+            self.content.pack_start(detail, False, False, 0)
+
+    @staticmethod
+    def _metric_card(caption: str, value: str, detail: str = "") -> Gtk.Widget:
+        card = Gtk.EventBox()
+        card.get_style_context().add_class("wb-summary-card")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        box.set_border_width(10)
+        card.add(box)
+
+        value_label = Gtk.Label(label=value)
+        value_label.set_xalign(0)
+        value_label.set_selectable(True)
+        value_label.get_style_context().add_class("wb-summary-value")
+        box.pack_start(value_label, False, False, 0)
+
+        caption_label = Gtk.Label(label=caption)
+        caption_label.set_xalign(0)
+        caption_label.set_line_wrap(True)
+        box.pack_start(caption_label, False, False, 0)
+
+        if detail:
+            detail_label = Gtk.Label(label=detail)
+            detail_label.set_xalign(0)
+            detail_label.set_line_wrap(True)
+            detail_label.get_style_context().add_class("wb-summary-caption")
+            box.pack_start(detail_label, False, False, 0)
+        return card
+
+    @staticmethod
+    def _bar_row(label: str, value: str, fraction: float, subtitle: str = "") -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.pack_start(header, False, False, 0)
+
+        name = Gtk.Label(label=label)
+        name.set_xalign(0)
+        name.set_ellipsize(Pango.EllipsizeMode.END)
+        name.set_tooltip_text(label)
+        header.pack_start(name, True, True, 0)
+
+        duration = Gtk.Label(label=value)
+        duration.set_xalign(1)
+        duration.set_selectable(True)
+        header.pack_end(duration, False, False, 0)
+
+        progress = Gtk.ProgressBar()
+        progress.set_fraction(max(0.0, min(1.0, float(fraction))))
+        progress.set_hexpand(True)
+        row.pack_start(progress, False, False, 0)
+
+        if subtitle:
+            detail = Gtk.Label(label=subtitle)
+            detail.set_xalign(0)
+            detail.set_ellipsize(Pango.EllipsizeMode.END)
+            detail.set_tooltip_text(subtitle)
+            detail.get_style_context().add_class("wb-summary-caption")
+            row.pack_start(detail, False, False, 0)
+        return row
+
+    def refresh(self) -> None:
+        self._clear()
+        day = self.day
+        stats = self.app.activity_log.get("days", {}).get(
+            day.isoformat(),
+            {
+                "work_seconds": 0,
+                "break_seconds": 0,
+                "credited_break_seconds": 0,
+                "regular_break_eligible_seconds": 0,
+                "overtime_seconds": 0,
+                "activity_totals": [],
+            },
+        )
+
+        work_seconds = max(0, int(stats.get("work_seconds", 0)))
+        break_seconds = max(0, int(stats.get("break_seconds", 0)))
+        credited_break_seconds = max(
+            0, int(self.app.credited_break_for_day_seconds(day, stats))
+        )
+        recoverable_break_seconds = max(0, break_seconds - credited_break_seconds)
+        counted_seconds = max(0, int(self.app.daily_counted_seconds(day)))
+        target_seconds = max(0, int(self.app._daily_target_seconds_for(day)))
+        remaining_seconds = max(0, int(self.app.daily_remaining_seconds(day)))
+        overtime_seconds = max(0, int(stats.get("overtime_seconds", 0)))
+        total_extra_seconds = max(0, int(self.app.total_extra_for_day_seconds(day)))
+        balance_before_seconds = int(self.app.time_balance_before_day_seconds(day))
+        if bool(stats.get("day_closed", False)):
+            balance_after_seconds = int(self.app.active_time_balance_seconds(day))
+        else:
+            balance_after_seconds = int(self.app.projected_time_balance_for_day_seconds(day))
+
+        date_title = Gtk.Label(label=format_italian_markdown_date(day))
+        date_title.set_xalign(0)
+        date_title.modify_font(Pango.FontDescription("Sans Bold 22"))
+        self.content.pack_start(date_title, False, False, 0)
+
+        goal_card = Gtk.EventBox()
+        goal_card.get_style_context().add_class("wb-summary-card")
+        goal_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+        goal_box.set_border_width(12)
+        goal_card.add(goal_box)
+        self.content.pack_start(goal_card, False, False, 0)
+
+        goal_title = Gtk.Label(label="Avanzamento della giornata")
+        goal_title.set_xalign(0)
+        goal_title.get_style_context().add_class("wb-chart-title")
+        goal_box.pack_start(goal_title, False, False, 0)
+
+        goal_bar = Gtk.ProgressBar()
+        goal_bar.set_show_text(True)
+        if self.app.day_has_regular_target(day) and target_seconds > 0:
+            goal_bar.set_fraction(min(1.0, counted_seconds / target_seconds))
+            if remaining_seconds > 0:
+                goal_bar.set_text(
+                    f"{self._duration(self.app, counted_seconds)} su "
+                    f"{self._duration(self.app, target_seconds)} · "
+                    f"mancano {self._duration(self.app, remaining_seconds)}"
+                )
+            else:
+                surplus = max(0, counted_seconds - target_seconds)
+                suffix = (
+                    f" · +{self._duration(self.app, surplus)}"
+                    if surplus > 0
+                    else " · obiettivo raggiunto"
+                )
+                goal_bar.set_text(
+                    f"{self._duration(self.app, counted_seconds)} su "
+                    f"{self._duration(self.app, target_seconds)}{suffix}"
+                )
+        elif self.app._is_special_workday(day, stats):
+            goal_bar.set_fraction(1.0 if work_seconds > 0 else 0.0)
+            goal_bar.set_text(
+                f"Giornata EXTRA · {self._duration(self.app, work_seconds)} lavorate"
+            )
+        else:
+            goal_bar.set_fraction(0.0)
+            goal_bar.set_text("Nessun obiettivo ordinario previsto")
+        goal_box.pack_start(goal_bar, False, False, 0)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(12)
+        grid.set_row_spacing(12)
+        grid.set_column_homogeneous(True)
+        cards = [
+            ("Lavoro effettivo", self._duration(self.app, work_seconds), "Tempo attribuito alle attività"),
+            ("Pause totali", self._duration(self.app, break_seconds), "Tutto il tempo trascorso in pausa"),
+            ("Pausa abbuonata", self._duration(self.app, credited_break_seconds), "Quota conteggiata nell’obiettivo"),
+            ("Pausa da recuperare", self._duration(self.app, recoverable_break_seconds), "Parte non conteggiata come lavoro"),
+            ("Straordinario oltre fascia", self._duration(self.app, overtime_seconds), "Lavoro confermato dopo l’orario"),
+            ("EXTRA totale del giorno", self._duration(self.app, total_extra_seconds), "Festivi, ferie o limite settimanale"),
+            ("Saldo iniziale", self._signed_duration(balance_before_seconds), "Credito o debito prima della giornata"),
+            ("Saldo dopo la giornata", self._signed_duration(balance_after_seconds), "Valore aggiornato con i dati correnti"),
+        ]
+        for index, (caption, value, detail) in enumerate(cards):
+            grid.attach(self._metric_card(caption, value, detail), index % 2, index // 2, 1, 1)
+        self.content.pack_start(grid, False, False, 0)
+
+        self._section_title(
+            "Composizione del tempo",
+            "Le barre confrontano lavoro, pausa abbuonata e pausa da recuperare.",
+        )
+        composition = [
+            ("Lavoro effettivo", work_seconds),
+            ("Pausa abbuonata", credited_break_seconds),
+            ("Pausa da recuperare", recoverable_break_seconds),
+        ]
+        composition_max = max([value for _label, value in composition] + [1])
+        composition_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for label, seconds in composition:
+            composition_box.pack_start(
+                self._bar_row(
+                    label,
+                    self._duration(self.app, seconds),
+                    seconds / composition_max,
+                ),
+                False,
+                False,
+                0,
+            )
+        self.content.pack_start(composition_box, False, False, 0)
+
+        rows = self.app._activity_totals_for(day, include_unclassified=True)
+        rows = sorted(
+            rows,
+            key=lambda item: int(item.get("work_seconds", 0)),
+            reverse=True,
+        )
+        self._section_title(
+            "Tempo per attività",
+            "Le attività sono ordinate dalla più lunga alla più breve.",
+        )
+        if not rows:
+            empty = Gtk.Label(label="Nessuna attività registrata per questa giornata.")
+            empty.set_xalign(0)
+            self.content.pack_start(empty, False, False, 0)
+        else:
+            activities_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            max_activity_seconds = max(
+                [max(0, int(item.get("work_seconds", 0))) for item in rows] + [1]
+            )
+            for item in rows:
+                seconds = max(0, int(item.get("work_seconds", 0)))
+                activity = str(item.get("text", "")).strip() or "Tempo non classificato"
+                project = str(item.get("project", "")).strip() or "Senza progetto"
+                activities_box.pack_start(
+                    self._bar_row(
+                        activity,
+                        self._duration(self.app, seconds),
+                        seconds / max_activity_seconds,
+                        project,
+                    ),
+                    False,
+                    False,
+                    0,
+                )
+            self.content.pack_start(activities_box, False, False, 0)
+
+        self.content.show_all()
+
+
+class DaySummaryWindow(Gtk.Window):
+    """Riepilogo giornaliero con tab Markdown e tab grafico."""
+
+    def __init__(
+        self,
+        app: "WorkBreakApp",
+        day: dt.date,
+        parent: Optional[Gtk.Window] = None,
+    ):
+        super().__init__(title="Riepilogo giornaliero")
+        self.app = app
+        self.day = day
+        if parent is not None:
+            self.set_transient_for(parent)
+            self.set_modal(True)
+            self.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        else:
+            self.set_modal(False)
+            self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_default_size(860, 680)
+        self.set_border_width(14)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(outer)
+
+        title = Gtk.Label(label=f"Riepilogo · {format_italian_markdown_date(day)}")
+        title.set_xalign(0)
+        title.modify_font(Pango.FontDescription("Sans Bold 17"))
+        outer.pack_start(title, False, False, 0)
+
+        self.notebook = Gtk.Notebook()
+        self.notebook.set_scrollable(True)
+        outer.pack_start(self.notebook, True, True, 0)
+
+        markdown_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.text_view = Gtk.TextView()
+        self.text_view.set_editable(True)
+        self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.text_view.set_monospace(True)
+        self.text_view.get_buffer().set_text(app.build_day_markdown(day))
+        markdown_scroll = Gtk.ScrolledWindow()
+        markdown_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        markdown_scroll.add(self.text_view)
+        markdown_box.pack_start(markdown_scroll, True, True, 0)
+        self.notebook.append_page(markdown_box, Gtk.Label(label="Markdown"))
+
+        self.chart_view = DayChartView(app, day)
+        self.notebook.append_page(self.chart_view, Gtk.Label(label="Grafico"))
+
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        outer.pack_start(footer, False, False, 0)
+
+        copy_button = Gtk.Button(label="Copia Markdown")
+        copy_button.connect("clicked", self._copy_markdown)
+        footer.pack_start(copy_button, False, False, 0)
+
+        refresh_button = Gtk.Button(label="Aggiorna grafico")
+        refresh_button.connect("clicked", lambda *_: self.chart_view.refresh())
+        footer.pack_start(refresh_button, False, False, 0)
+
+        close_button = Gtk.Button(label="Chiudi")
+        close_button.connect("clicked", lambda *_: self.destroy())
+        footer.pack_end(close_button, False, False, 0)
+
+        self.show_all()
+        width, height = 860, 680
+        geometry = active_monitor_geometry()
+        if geometry is not None:
+            width = max(620, min(width, geometry.width - 64))
+            height = max(460, min(height, geometry.height - 96))
+        self.resize(width, height)
+        place_on_active_monitor(self, width, height)
+        self.present()
+
+    def _copy_markdown(self, button: Gtk.Button) -> None:
+        buffer = self.text_view.get_buffer()
+        start, end = buffer.get_bounds()
+        current_text = buffer.get_text(start, end, True)
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(current_text, -1)
+        clipboard.store()
+        button.set_label("Copiato")
+        GLib.timeout_add_seconds(2, lambda: self._restore_copy_label(button))
+
+    @staticmethod
+    def _restore_copy_label(button: Gtk.Button) -> bool:
+        if button.get_parent() is not None:
+            button.set_label("Copia Markdown")
+        return False
+
+
 class ActivitySummaryWindow(Gtk.Window):
     def __init__(self, app: "WorkBreakApp", selected_day: Optional[dt.date] = None):
         super().__init__(title="Attività e tempi")
         self.app = app
         self.selected_day = selected_day or dt.date.today()
         self._changing_day = False
-        self.markdown_window: Optional[MarkdownPreviewWindow] = None
+        self.markdown_window: Optional[Gtk.Window] = None
         self.set_default_size(940, 580)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_border_width(16)
@@ -1080,8 +1726,8 @@ class ActivitySummaryWindow(Gtk.Window):
         delete_button.connect("clicked", lambda *_: self._delete_selected())
         actions.pack_start(delete_button, False, False, 0)
 
-        markdown_button = Gtk.Button(label="Mostra Markdown")
-        markdown_button.connect("clicked", lambda *_: self._show_markdown())
+        markdown_button = Gtk.Button(label="Mostra riepilogo")
+        markdown_button.connect("clicked", lambda *_: self._show_summary())
         actions.pack_end(markdown_button, False, False, 0)
 
         overtime_button = Gtk.Button(label="Straordinari ed EXTRA del mese")
@@ -1291,11 +1937,10 @@ class ActivitySummaryWindow(Gtk.Window):
             )
         self.refresh()
 
-    def _show_markdown(self) -> None:
-        markdown_text = self.app.build_day_markdown(self.selected_day)
+    def _show_summary(self) -> None:
         if self.markdown_window and self.markdown_window.get_visible():
             self.markdown_window.destroy()
-        self.markdown_window = MarkdownPreviewWindow(self, markdown_text)
+        self.markdown_window = DaySummaryWindow(self.app, self.selected_day, self)
 
     def _show_month_overtime(self) -> None:
         markdown_text = self.app.build_month_overtime_markdown(
@@ -1321,7 +1966,8 @@ class ActivitySummaryWindow(Gtk.Window):
         self.date_label.set_text(self.selected_day.strftime("%A %d/%m/%Y").capitalize())
         work = self.app._format_effective_minutes(stats.get("work_seconds", 0))
         pause = self.app._format_effective_minutes(stats.get("break_seconds", 0))
-        credited_pause = self.app._format_effective_minutes(stats.get("credited_break_seconds", 0))
+        credited_pause_seconds = self.app.credited_break_for_day_seconds(self.selected_day, stats)
+        credited_pause = self.app._format_effective_minutes(credited_pause_seconds)
         counted = self.app._format_effective_minutes(self.app.daily_counted_seconds(self.selected_day))
         target = self.app._format_effective_minutes(self.app._daily_target_seconds_for(self.selected_day))
         remaining = self.app._format_effective_minutes(self.app.daily_remaining_seconds(self.selected_day))
@@ -1541,12 +2187,37 @@ class MiddayRecoveryWindow(Gtk.Window):
         place_on_active_monitor(self, 560, 320)
         self.present()
 
-    def update(self, seconds_left: int) -> None:
-        self.timer.set_text(format_mmss(seconds_left))
-        if seconds_left <= 0:
+    def update(
+        self,
+        seconds_left: int,
+        overrun_seconds: int = 0,
+        started_late: bool = False,
+    ) -> None:
+        seconds_left = max(0, int(seconds_left))
+        overrun_seconds = max(0, int(overrun_seconds))
+        if overrun_seconds > 0:
+            self.timer.set_text(format_negative_countdown(overrun_seconds))
             self.hint.set_text(
-                "La pausa prevista è stata recuperata. Premi il pulsante per indicare che hai ripreso a lavorare."
+                "La pausa prevista è terminata e stai sforando da "
+                f"{format_mmss(overrun_seconds)}. Premi il pulsante quando riprendi a lavorare."
             )
+        elif seconds_left <= 0:
+            self.timer.set_text("00:00")
+            self.hint.set_text(
+                "La pausa prevista è terminata. Se non riprendi ora, il timer inizierà a contare in negativo."
+            )
+        else:
+            self.timer.set_text(format_mmss(seconds_left))
+            if started_late:
+                self.hint.set_text(
+                    "Hai iniziato la pausa dopo la fine della mattina: il rientro è stato spostato "
+                    "per garantirti l’intera pausa prevista. Puoi interromperla quando vuoi."
+                )
+            else:
+                self.hint.set_text(
+                    "Il countdown termina all’orario previsto di rientro. Se continui la pausa, "
+                    "proseguirà in negativo finché non confermi di aver ripreso."
+                )
 
 
 class DailyCompensationWindow(Gtk.Window):
@@ -1717,6 +2388,7 @@ class DayOffManagerWindow(Gtk.Window):
     def __init__(self, app: "WorkBreakApp"):
         super().__init__(title="Ferie, festività e giornate extra")
         self.app = app
+        self.persisted_settings = Settings.load()
         self.set_default_size(820, 520)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_border_width(16)
@@ -1734,7 +2406,8 @@ class DayOffManagerWindow(Gtk.Window):
             label=(
                 "Aggiungi singoli giorni o intervalli. Puoi anche autorizzare una giornata "
                 "festiva, di ferie o normalmente non lavorativa: tutte le ore svolte in quel "
-                "giorno saranno conteggiate separatamente come EXTRA."
+                "giorno saranno conteggiate separatamente come EXTRA. Le modifiche al calendario "
+                "saranno applicate al prossimo avvio, senza interrompere il timer corrente."
             )
         )
         info.set_xalign(0)
@@ -1824,16 +2497,29 @@ class DayOffManagerWindow(Gtk.Window):
         return values
 
     def _save_entries(self, entries: list[dict]) -> None:
-        self.app.settings.custom_days_off = entries
-        self.app.settings.save()
-        self.app.calendar_settings_changed()
+        persisted = Settings.load()
+        persisted.custom_days_off = entries
+        persisted.save()
+        self.persisted_settings = persisted
+        if self.app.settings_window and self.app.settings_window.get_visible():
+            try:
+                self.app.settings_window.edit_settings = persisted
+                self.app.settings_window.holidays_count.set_text(
+                    f"{len(persisted.custom_days_off)} date o intervalli personalizzati"
+                )
+                self.app.settings_window.save_status.set_text(
+                    "Calendario salvato. Sarà applicato al prossimo avvio senza "
+                    "interrompere il timer corrente."
+                )
+            except Exception:
+                pass
         self.refresh()
 
     def _add_entry(self) -> None:
         values = self._open_editor("Aggiungi data o giornata lavorativa extra")
         if values is None:
             return
-        entries = list(self.app.settings.custom_days_off)
+        entries = list(self.persisted_settings.custom_days_off)
         entries.append(values)
         self._save_entries(entries)
 
@@ -1845,7 +2531,7 @@ class DayOffManagerWindow(Gtk.Window):
         values = self._open_editor("Modifica data o giornata lavorativa extra", selected)
         if values is None:
             return
-        entries = list(self.app.settings.custom_days_off)
+        entries = list(self.persisted_settings.custom_days_off)
         for index, item in enumerate(entries):
             if normalize_day_off_entry(item) == normalize_day_off_entry(selected):
                 entries[index] = values
@@ -1882,14 +2568,14 @@ class DayOffManagerWindow(Gtk.Window):
         normalized_selected = normalize_day_off_entry(selected)
         entries = [
             item
-            for item in self.app.settings.custom_days_off
+            for item in self.persisted_settings.custom_days_off
             if normalize_day_off_entry(item) != normalized_selected
         ]
         self._save_entries(entries)
 
     def refresh(self) -> None:
         self.store.clear()
-        for entry in self.app.settings.custom_days_off:
+        for entry in self.persisted_settings.custom_days_off:
             normalized = normalize_day_off_entry(entry)
             if normalized is None:
                 continue
@@ -1926,10 +2612,49 @@ class DayOffManagerWindow(Gtk.Window):
 
 
 class SettingsWindow(Gtk.Window):
+    RESTART_FIELDS = (
+        "work_minutes",
+        "break_minutes",
+        "regular_pause_credit_minutes",
+        "daily_pause_extra_credit_minutes",
+        "daily_target_hours",
+        "warning_seconds",
+        "overtime_reminder_minutes",
+        "extra_closure_day",
+        "extra_closure_weekday",
+        "active_days",
+        "morning_start",
+        "morning_end",
+        "afternoon_start",
+        "afternoon_end",
+        "skip_italian_holidays",
+        "local_holidays",
+        "custom_days_off",
+    )
+
+    IMMEDIATE_FIELDS = (
+        "audio_enabled",
+        "timer_end_sound",
+        "beep_volume",
+        "beep_count",
+        "beep_interval_seconds",
+        "markdown_include_task_times",
+    )
+
     def __init__(self, app: "WorkBreakApp"):
         super().__init__(title="Impostazioni WorkBreak Guard")
         self.app = app
-        self.set_default_size(680, 860)
+        # Mostra sempre i valori già salvati su disco. Durante l'esecuzione le
+        # impostazioni strutturali possono essere diverse da quelle attive,
+        # perché vengono applicate soltanto al prossimo avvio.
+        self.edit_settings = Settings.load()
+        screen = Gdk.Screen.get_default()
+        available_width = screen.get_width() - 100 if screen else 720
+        available_height = screen.get_height() - 100 if screen else 760
+        self.set_default_size(
+            max(560, min(760, available_width)),
+            max(420, min(820, available_height)),
+        )
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_border_width(18)
         self.set_keep_above(False)
@@ -1942,116 +2667,194 @@ class SettingsWindow(Gtk.Window):
         title.modify_font(Pango.FontDescription("Sans Bold 18"))
         outer.pack_start(title, False, False, 0)
 
+        apply_notice = Gtk.Label(
+            label=(
+                "Le voci contrassegnate con ↻ vengono salvate senza interrompere il lavoro "
+                "e saranno applicate al prossimo avvio del programma."
+            )
+        )
+        apply_notice.set_xalign(0)
+        apply_notice.set_line_wrap(True)
+        outer.pack_start(apply_notice, False, False, 0)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_shadow_type(Gtk.ShadowType.IN)
+        outer.pack_start(scrolled, True, True, 0)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        content.set_border_width(10)
+        scrolled.add_with_viewport(content)
+
+        actions_frame = Gtk.Frame(label="Azioni programma")
+        actions_grid = Gtk.Grid(column_spacing=10, row_spacing=10)
+        actions_grid.set_column_homogeneous(True)
+        actions_grid.set_border_width(10)
+        actions_frame.add(actions_grid)
+        content.pack_start(actions_frame, False, False, 0)
+
+        reset_now = Gtk.Button(label="Resetta e comincia adesso")
+        reset_now.connect("clicked", lambda *_: app.reset_and_start_now())
+        actions_grid.attach(reset_now, 0, 0, 1, 1)
+
+        activities = Gtk.Button(label="Attività e tempi")
+        activities.connect("clicked", lambda *_: app.show_activity_summary())
+        actions_grid.attach(activities, 1, 0, 1, 1)
+
+        day_offs = Gtk.Button(label="Ferie, festività e giornate EXTRA")
+        day_offs.connect("clicked", lambda *_: app.show_day_off_manager())
+        actions_grid.attach(day_offs, 0, 1, 1, 1)
+
+        show_control = Gtk.Button(label="Mostra controllo")
+        show_control.connect("clicked", lambda *_: app.show_control())
+        actions_grid.attach(show_control, 1, 1, 1, 1)
+
         grid = Gtk.Grid(column_spacing=12, row_spacing=10)
         grid.set_column_homogeneous(False)
-        outer.pack_start(grid, True, True, 0)
+        content.pack_start(grid, False, False, 0)
 
-        self.enabled = Gtk.CheckButton(label="Promemoria attivo")
+        self.enabled = Gtk.CheckButton(
+            label="Promemoria attivo (usa il pulsante in basso per disattivarlo o riattivarlo)"
+        )
         self.enabled.set_active(app.settings.enabled)
+        self.enabled.set_sensitive(False)
         grid.attach(self.enabled, 0, 0, 2, 1)
 
         self.audio = Gtk.CheckButton(label="Audio attivo, con volume lieve")
-        self.audio.set_active(app.settings.audio_enabled)
+        self.audio.set_active(self.edit_settings.audio_enabled)
         grid.attach(self.audio, 0, 1, 2, 1)
 
-        self.skip_holidays = Gtk.CheckButton(label="Non contare le festività nazionali italiane")
-        self.skip_holidays.set_active(app.settings.skip_italian_holidays)
+        self.skip_holidays = Gtk.CheckButton(label="↻ Non contare le festività nazionali italiane")
+        self.skip_holidays.set_active(self.edit_settings.skip_italian_holidays)
         grid.attach(self.skip_holidays, 0, 2, 2, 1)
 
-        self.este_holiday = Gtk.CheckButton(label="Includi Santa Tecla, patrona di Este — 23 settembre")
-        self.este_holiday.set_active("este" in app.settings.local_holidays)
+        self.este_holiday = Gtk.CheckButton(label="↻ Includi Santa Tecla, patrona di Este — 23 settembre")
+        self.este_holiday.set_active("este" in self.edit_settings.local_holidays)
         grid.attach(self.este_holiday, 0, 3, 2, 1)
 
         self.florence_holiday = Gtk.CheckButton(
-            label="Includi San Giovanni Battista, patrono di Firenze — 24 giugno"
+            label="↻ Includi San Giovanni Battista, patrono di Firenze — 24 giugno"
         )
-        self.florence_holiday.set_active("firenze" in app.settings.local_holidays)
+        self.florence_holiday.set_active("firenze" in self.edit_settings.local_holidays)
         grid.attach(self.florence_holiday, 0, 4, 2, 1)
 
         self.autostart_enabled = Gtk.CheckButton(label="Avvia automaticamente all'accesso")
         self.autostart_enabled.set_active(is_autostart_enabled())
         grid.attach(self.autostart_enabled, 0, 5, 2, 1)
 
-        self.work_minutes = self._spin(app.settings.work_minutes, 5, 240)
-        self.break_minutes = self._spin(app.settings.break_minutes, 1, 60)
-        self.daily_target_hours = self._spin(app.settings.daily_target_hours, 1, 24)
-        self.warning_seconds = self._spin(app.settings.warning_seconds, 5, 600)
-        self.overtime_reminder_minutes = self._spin(app.settings.overtime_reminder_minutes, 1, 120)
-        self.extra_closure_day = self._spin(app.settings.extra_closure_day, 1, 28)
+        self.work_minutes = self._spin(self.edit_settings.work_minutes, 5, 240)
+        self.break_minutes = self._spin(self.edit_settings.break_minutes, 1, 60)
+        self.regular_pause_credit_minutes = self._spin(
+            self.edit_settings.regular_pause_credit_minutes, 0, 60
+        )
+        self.daily_pause_extra_credit_minutes = self._spin(
+            self.edit_settings.daily_pause_extra_credit_minutes, 0, 240
+        )
+        self.daily_target_hours = self._spin(self.edit_settings.daily_target_hours, 1, 24)
+        self.warning_seconds = self._spin(self.edit_settings.warning_seconds, 5, 600)
+        self.overtime_reminder_minutes = self._spin(self.edit_settings.overtime_reminder_minutes, 1, 120)
+        self.extra_closure_day = self._spin(self.edit_settings.extra_closure_day, 1, 28)
         self.extra_closure_weekday = Gtk.ComboBoxText()
         for index, weekday_name in enumerate(
             ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
         ):
             self.extra_closure_weekday.append(str(index), weekday_name)
-        self.extra_closure_weekday.set_active_id(str(app.settings.extra_closure_weekday))
-        self.beep_count = self._spin(app.settings.beep_count, 0, 20)
-        self.beep_interval = self._spin(app.settings.beep_interval_seconds, 5, 300)
+        self.extra_closure_weekday.set_active_id(str(self.edit_settings.extra_closure_weekday))
+        self.timer_end_sound = Gtk.ComboBoxText()
+        for sound_id, sound_label in TIMER_END_SOUND_OPTIONS.items():
+            self.timer_end_sound.append(sound_id, sound_label)
+        self.timer_end_sound.set_active_id(self.edit_settings.timer_end_sound)
+        timer_sound_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        timer_sound_box.pack_start(self.timer_end_sound, True, True, 0)
+        preview_sound = Gtk.Button(label="Prova")
+        preview_sound.connect("clicked", self._preview_timer_sound)
+        timer_sound_box.pack_start(preview_sound, False, False, 0)
+        self.timer_sound_box = timer_sound_box
+        self.beep_count = self._spin(self.edit_settings.beep_count, 0, 20)
+        self.beep_interval = self._spin(self.edit_settings.beep_interval_seconds, 5, 300)
         self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 30, 1)
-        self.volume.set_value(int(app.settings.beep_volume * 100))
+        self.volume.set_value(int(self.edit_settings.beep_volume * 100))
         self.volume.set_digits(0)
 
         row = 6
-        row = self._labeled(grid, row, "Minuti lavoro", self.work_minutes)
-        row = self._labeled(grid, row, "Minuti pausa", self.break_minutes)
-        row = self._labeled(grid, row, "Tempo massimo per giornata, ore", self.daily_target_hours)
-        row = self._labeled(grid, row, "Tempo predefinito prima di 'Fermati subito', secondi", self.warning_seconds)
+        row = self._labeled(grid, row, "↻ Minuti lavoro", self.work_minutes)
+        row = self._labeled(grid, row, "↻ Minuti pausa", self.break_minutes)
         row = self._labeled(
             grid,
             row,
-            "Promemoria lavoro oltre orario, minuti",
+            "↻ Quota pausa regolare ogni 2 ore, minuti",
+            self.regular_pause_credit_minutes,
+        )
+        row = self._labeled(
+            grid,
+            row,
+            "↻ Abbuono extra giornaliero pause, minuti",
+            self.daily_pause_extra_credit_minutes,
+        )
+        row = self._labeled(grid, row, "↻ Tempo massimo per giornata, ore", self.daily_target_hours)
+        row = self._labeled(grid, row, "↻ Tempo predefinito prima di 'Fermati subito', secondi", self.warning_seconds)
+        row = self._labeled(
+            grid,
+            row,
+            "↻ Promemoria lavoro oltre orario, minuti",
             self.overtime_reminder_minutes,
         )
         row = self._labeled(
             grid,
             row,
-            "Chiusura mensile EXTRA: giorno base del mese",
+            "↻ Chiusura mensile EXTRA: giorno base del mese",
             self.extra_closure_day,
         )
         row = self._labeled(
             grid,
             row,
-            "Primo giorno uguale o successivo per la chiusura",
+            "↻ Primo giorno uguale o successivo per la chiusura",
             self.extra_closure_weekday,
+        )
+        row = self._labeled(
+            grid, row, "Suono alla scadenza dei timer", self.timer_sound_box
         )
         row = self._labeled(grid, row, "Numero beep in pausa", self.beep_count)
         row = self._labeled(grid, row, "Distanza beep, secondi", self.beep_interval)
         row = self._labeled(grid, row, "Volume beep 0-30%", self.volume)
 
-        self.morning_start = Gtk.Entry(text=app.settings.morning_start)
-        self.morning_end = Gtk.Entry(text=app.settings.morning_end)
-        self.afternoon_start = Gtk.Entry(text=app.settings.afternoon_start)
-        self.afternoon_end = Gtk.Entry(text=app.settings.afternoon_end)
-        row = self._labeled(grid, row, "Mattina inizio HH:MM", self.morning_start)
-        row = self._labeled(grid, row, "Mattina fine HH:MM", self.morning_end)
-        row = self._labeled(grid, row, "Pomeriggio inizio HH:MM", self.afternoon_start)
-        row = self._labeled(grid, row, "Pomeriggio fine HH:MM", self.afternoon_end)
+        self.morning_start = Gtk.Entry(text=self.edit_settings.morning_start)
+        self.morning_end = Gtk.Entry(text=self.edit_settings.morning_end)
+        self.afternoon_start = Gtk.Entry(text=self.edit_settings.afternoon_start)
+        self.afternoon_end = Gtk.Entry(text=self.edit_settings.afternoon_end)
+        row = self._labeled(grid, row, "↻ Mattina inizio HH:MM", self.morning_start)
+        row = self._labeled(grid, row, "↻ Mattina fine HH:MM", self.morning_end)
+        row = self._labeled(grid, row, "↻ Pomeriggio inizio HH:MM", self.afternoon_start)
+        row = self._labeled(grid, row, "↻ Pomeriggio fine HH:MM", self.afternoon_end)
 
         days_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.days = []
         for idx, name in enumerate(["L", "M", "M", "G", "V", "S", "D"]):
             chk = Gtk.CheckButton(label=name)
-            chk.set_active(idx in app.settings.active_days)
+            chk.set_active(idx in self.edit_settings.active_days)
             self.days.append(chk)
             days_box.pack_start(chk, False, False, 0)
-        row = self._labeled(grid, row, "Giorni attivi", days_box)
+        row = self._labeled(grid, row, "↻ Giorni attivi", days_box)
 
         holidays_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.holidays_count = Gtk.Label(
-            label=f"{len(app.settings.custom_days_off)} date o intervalli personalizzati"
+            label=f"{len(self.edit_settings.custom_days_off)} date o intervalli personalizzati"
         )
         self.holidays_count.set_xalign(0)
         holidays_box.pack_start(self.holidays_count, True, True, 0)
-        holidays_button = Gtk.Button(label="Gestisci ferie, festività e giornate EXTRA…")
-        holidays_button.connect("clicked", lambda *_: app.show_day_off_manager())
-        holidays_box.pack_end(holidays_button, False, False, 0)
-        row = self._labeled(grid, row, "Calendario e giornate EXTRA", holidays_box)
+        row = self._labeled(grid, row, "↻ Calendario e giornate EXTRA", holidays_box)
 
         self.markdown_include_task_times = Gtk.CheckButton(
             label="Mostra il tempo impiegato per ogni task nel Markdown"
         )
-        self.markdown_include_task_times.set_active(app.settings.markdown_include_task_times)
+        self.markdown_include_task_times.set_active(self.edit_settings.markdown_include_task_times)
         grid.attach(self.markdown_include_task_times, 0, row, 2, 1)
         row += 1
+
+        self.save_status = Gtk.Label(label="")
+        self.save_status.set_xalign(0)
+        self.save_status.set_line_wrap(True)
+        outer.pack_start(self.save_status, False, False, 0)
 
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         outer.pack_start(controls, False, False, 0)
@@ -2060,12 +2863,12 @@ class SettingsWindow(Gtk.Window):
         save.connect("clicked", self._save)
         controls.pack_start(save, False, False, 0)
 
-        pause = Gtk.Button(label="Pausa/Riattiva ora")
+        pause = Gtk.Button(label="Disattiva/Riattiva promemoria")
         pause.connect("clicked", lambda *_: app.toggle_enabled())
         controls.pack_start(pause, False, False, 0)
 
-        start_break = Gtk.Button(label="Avvia pausa adesso")
-        start_break.connect("clicked", lambda *_: app.force_break_now())
+        start_break = Gtk.Button(label="Metti in pausa")
+        start_break.connect("clicked", lambda *_: app.request_manual_pause())
         controls.pack_start(start_break, False, False, 0)
 
         close = Gtk.Button(label="Chiudi")
@@ -2073,6 +2876,10 @@ class SettingsWindow(Gtk.Window):
         controls.pack_end(close, False, False, 0)
 
         self.show_all()
+
+    def _preview_timer_sound(self, *_args) -> None:
+        sound_id = self.timer_end_sound.get_active_id() or "soft"
+        self.app._play_sound(sound_id)
 
     def _spin(self, value: int, low: int, high: int) -> Gtk.SpinButton:
         adj = Gtk.Adjustment(value=value, lower=low, upper=high, step_increment=1, page_increment=5)
@@ -2087,47 +2894,87 @@ class SettingsWindow(Gtk.Window):
         return row + 1
 
     def _save(self, *_args) -> None:
-        s = self.app.settings
-        s.enabled = self.enabled.get_active()
-        s.audio_enabled = self.audio.get_active()
-        s.skip_italian_holidays = self.skip_holidays.get_active()
-        s.local_holidays = []
+        # Costruisce una copia destinata al file di configurazione senza
+        # modificare la configurazione strutturale usata dal timer corrente.
+        current = self.app.settings
+        pending = Settings(**asdict(Settings.load()))
+        pending.enabled = current.enabled
+        pending.audio_enabled = self.audio.get_active()
+        pending.skip_italian_holidays = self.skip_holidays.get_active()
+        pending.local_holidays = []
         if self.este_holiday.get_active():
-            s.local_holidays.append("este")
+            pending.local_holidays.append("este")
         if self.florence_holiday.get_active():
-            s.local_holidays.append("firenze")
-        s.work_minutes = int(self.work_minutes.get_value())
-        s.break_minutes = int(self.break_minutes.get_value())
-        s.daily_target_hours = int(self.daily_target_hours.get_value())
-        s.warning_seconds = int(self.warning_seconds.get_value())
-        s.overtime_reminder_minutes = int(self.overtime_reminder_minutes.get_value())
-        s.extra_closure_day = int(self.extra_closure_day.get_value())
-        s.markdown_include_task_times = self.markdown_include_task_times.get_active()
+            pending.local_holidays.append("firenze")
+        pending.work_minutes = int(self.work_minutes.get_value())
+        pending.break_minutes = int(self.break_minutes.get_value())
+        pending.regular_pause_credit_minutes = int(
+            self.regular_pause_credit_minutes.get_value()
+        )
+        pending.daily_pause_extra_credit_minutes = int(
+            self.daily_pause_extra_credit_minutes.get_value()
+        )
+        pending.daily_target_hours = int(self.daily_target_hours.get_value())
+        pending.warning_seconds = int(self.warning_seconds.get_value())
+        pending.overtime_reminder_minutes = int(
+            self.overtime_reminder_minutes.get_value()
+        )
+        pending.extra_closure_day = int(self.extra_closure_day.get_value())
+        pending.markdown_include_task_times = (
+            self.markdown_include_task_times.get_active()
+        )
         try:
-            s.extra_closure_weekday = int(self.extra_closure_weekday.get_active_id() or 0)
+            pending.extra_closure_weekday = int(
+                self.extra_closure_weekday.get_active_id() or 0
+            )
         except Exception:
-            s.extra_closure_weekday = 0
-        s.beep_count = int(self.beep_count.get_value())
-        s.beep_interval_seconds = int(self.beep_interval.get_value())
-        s.beep_volume = float(self.volume.get_value()) / 100.0
-        s.morning_start = self.morning_start.get_text()
-        s.morning_end = self.morning_end.get_text()
-        s.afternoon_start = self.afternoon_start.get_text()
-        s.afternoon_end = self.afternoon_end.get_text()
-        s.active_days = [idx for idx, chk in enumerate(self.days) if chk.get_active()]
-        s.save()
+            pending.extra_closure_weekday = 0
+        pending.timer_end_sound = self.timer_end_sound.get_active_id() or "soft"
+        pending.beep_count = int(self.beep_count.get_value())
+        pending.beep_interval_seconds = int(self.beep_interval.get_value())
+        pending.beep_volume = float(self.volume.get_value()) / 100.0
+        pending.morning_start = self.morning_start.get_text()
+        pending.morning_end = self.morning_end.get_text()
+        pending.afternoon_start = self.afternoon_start.get_text()
+        pending.afternoon_end = self.afternoon_end.get_text()
+        pending.active_days = [
+            idx for idx, chk in enumerate(self.days) if chk.get_active()
+        ]
+        pending.save()
+
+        restart_required = any(
+            getattr(current, field_name) != getattr(pending, field_name)
+            for field_name in self.RESTART_FIELDS
+        )
+
+        # Solo le preferenze realmente innocue vengono applicate subito.
+        # Non richiamare reload_schedule(), toggle_enabled() o metodi di reset:
+        # salvare non deve mai alterare fase, residuo o attività corrente.
+        for field_name in self.IMMEDIATE_FIELDS:
+            setattr(current, field_name, getattr(pending, field_name))
+
         set_autostart_enabled(self.autostart_enabled.get_active())
-        self.app.reload_schedule()
+        self.enabled.set_active(current.enabled)
         self.app.update_indicator_menu()
         self.app._update_ui()
-        AlertWindow("Salvato", "Le impostazioni sono state aggiornate.", "OK")
+
+        if restart_required:
+            self.save_status.set_text(
+                "Salvato. Le modifiche contrassegnate con ↻ saranno applicate "
+                "al prossimo avvio; il timer corrente continua senza interruzioni."
+            )
+        else:
+            self.save_status.set_text(
+                "Salvato. Le preferenze immediate sono state aggiornate senza "
+                "interrompere il timer."
+            )
 
 
 class ControlWindow(Gtk.Window):
     def __init__(self, app: "WorkBreakApp"):
         super().__init__(title=APP_NAME)
         self.app = app
-        self.set_default_size(430, 190)
+        self.set_default_size(560, 260)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_border_width(14)
         self.connect("delete-event", self._on_delete)
@@ -2158,6 +3005,18 @@ class ControlWindow(Gtk.Window):
         reset_now = Gtk.Button(label="Resetta e comincia adesso")
         reset_now.connect("clicked", lambda *_: app.reset_and_start_now())
         actions.pack_start(reset_now, True, True, 0)
+
+        manual_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.pack_start(manual_actions, False, False, 0)
+        self.start_now_btn = Gtk.Button(label="Inizia a lavorare adesso")
+        self.start_now_btn.connect("clicked", lambda *_: app.request_start_work_now())
+        manual_actions.pack_start(self.start_now_btn, True, True, 0)
+        self.manual_pause_btn = Gtk.Button(label="Pausa manuale…")
+        self.manual_pause_btn.connect("clicked", lambda *_: app.request_manual_pause())
+        manual_actions.pack_start(self.manual_pause_btn, True, True, 0)
+        self.finish_day_btn = Gtk.Button(label="Termina giornata")
+        self.finish_day_btn.connect("clicked", lambda *_: app.request_finish_day_early())
+        manual_actions.pack_start(self.finish_day_btn, True, True, 0)
         self.show_all()
 
     def _on_delete(self, *_args) -> bool:
@@ -2166,7 +3025,41 @@ class ControlWindow(Gtk.Window):
 
     def update(self, text: str, enabled: bool) -> None:
         self.status.set_text(text)
-        self.toggle_btn.set_label("Pausa" if enabled else "Riattiva")
+        self.toggle_btn.set_label("Disattiva Promemoria" if enabled else "Riattiva promemoria")
+        if self.app.in_midday_recovery:
+            self.start_now_btn.set_label("Interrompi pausa e inizia")
+        elif self.app.day_suspended:
+            self.start_now_btn.set_label("Riprendi la giornata")
+        else:
+            self.start_now_btn.set_label("Inizia a lavorare adesso")
+        self.start_now_btn.set_sensitive(
+            enabled
+            and (
+                self.app.day_suspended
+                or self.app.in_midday_recovery
+                or self.app.current_session is None
+                or self.app.waiting_session_start
+                or self.app.manual_break
+                or self.app.in_break
+                or self.app.waiting_return
+            )
+        )
+        self.manual_pause_btn.set_label(
+            "Riprendi il lavoro"
+            if self.app.manual_break or self.app.in_break or self.app.waiting_return
+            else "Pausa manuale…"
+        )
+        self.manual_pause_btn.set_sensitive(
+            enabled and self.app.current_session is not None and not self.app.day_suspended
+        )
+        self.finish_day_btn.set_sensitive(
+            enabled
+            and self.app.current_session is not None
+            and not self.app.day_suspended
+            and not self.app.waiting_session_start
+            and not self.app.waiting_daily_close_choice
+            and not self.app.in_midday_recovery
+        )
 
 
 class WorkBreakApp:
@@ -2176,6 +3069,11 @@ class WorkBreakApp:
         self.grace_remaining = 0
         self.break_remaining = 0
         self.break_elapsed = 0
+        self.regular_break_credit_remaining = 0
+        self.break_credit_eligible_seconds = 0
+        self.break_planned_seconds = 0
+        self.break_credited_seconds = 0
+        self.return_overrun_seconds = 0
         self.waiting_session_start = False
         self.waiting_grace_choice = False
         self.waiting_break_start = False
@@ -2192,12 +3090,24 @@ class WorkBreakApp:
         self.in_midday_recovery = False
         self.midday_recovery_remaining = 0
         self.midday_recovery_total = 0
+        self.midday_recovery_overrun_seconds = 0
+        self.midday_recovery_started_late = False
         self.afternoon_started_early = False
         self.waiting_daily_close_choice = False
         self.compensating_daily_balance = False
         self.compensation_remaining = 0
         self.compensation_day: Optional[dt.date] = None
         self.break_truncated_by_day_end = False
+        self.manual_break = False
+        self.manual_break_indefinite = False
+        self.manual_schedule_override = False
+        self.manual_open_ended_work = False
+        self.day_suspended = False
+        # Quando i promemoria vengono riattivati con “Continua”, il ciclo deve
+        # conservare esattamente il residuo congelato senza essere ricappato
+        # automaticamente all'orario di fine fascia.
+        self.resume_preserves_cycle = False
+        self.pending_manual_session: Optional[str] = None
         self.current_session: Optional[str] = None
         self.current_session_date: Optional[dt.date] = None
         self.current_activity = ""
@@ -2215,12 +3125,16 @@ class WorkBreakApp:
         self.session_window: Optional[ActivityPromptWindow] = None
         self.activity_window: Optional[ActivityPromptWindow] = None
         self.summary_window: Optional[ActivitySummaryWindow] = None
-        self.day_markdown_window: Optional[MarkdownPreviewWindow] = None
+        self.day_markdown_window: Optional[DaySummaryWindow] = None
         self.day_off_window: Optional[DayOffManagerWindow] = None
         self.session_end_window: Optional[ChoiceAlertWindow] = None
         self.midday_recovery_window: Optional[MiddayRecoveryWindow] = None
         self.daily_close_window: Optional[ChoiceAlertWindow] = None
         self.compensation_window: Optional[DailyCompensationWindow] = None
+        self.manual_pause_window: Optional[ManualPauseWindow] = None
+        self.regular_pause_window: Optional[RegularPauseWindow] = None
+        self.reminder_reactivation_window: Optional[ChoiceAlertWindow] = None
+        self.regular_pause_origin = "stop"
         # Mantenuti per compatibilità interna, ma i countdown non usano più popup.
         self.break_window: Optional[BreakCountdown] = None
         self.clock = ClockOverlay()
@@ -2230,7 +3144,8 @@ class WorkBreakApp:
         self.indicator = None
         self.indicator_status_item: Optional[Gtk.MenuItem] = None
         self.indicator_toggle_item: Optional[Gtk.MenuItem] = None
-        self.beep_file = self._build_beep_file()
+        self.sound_files: dict[str, Path] = {}
+        self.beep_file = self._build_sound_file("soft")
 
         self._setup_indicator_or_control()
         self._restore_latest_activity()
@@ -2295,55 +3210,73 @@ class WorkBreakApp:
         self.indicator_status_item = Gtk.MenuItem(label=self.status_text())
         self.indicator_status_item.set_sensitive(False)
         menu.append(self.indicator_status_item)
+        menu.append(Gtk.SeparatorMenuItem())
 
         self.indicator_toggle_item = Gtk.MenuItem(
-            label="Pausa promemoria" if self.settings.enabled else "Riattiva promemoria"
+            label="Disattiva Promemoria" if self.settings.enabled else "Riattiva promemoria"
         )
         self.indicator_toggle_item.connect("activate", lambda *_: self.toggle_enabled())
         menu.append(self.indicator_toggle_item)
 
-        activity_item = Gtk.MenuItem(label="Cosa stai facendo adesso?")
+        activity_item = Gtk.MenuItem(
+            label="Cosa stai facendo adesso? (CTRL + ALT + Q)"
+        )
         activity_item.connect("activate", lambda *_: self.request_activity_prompt())
         menu.append(activity_item)
 
-        reset_now = Gtk.MenuItem(label="Resetta e comincia adesso")
-        reset_now.connect("activate", lambda *_: self.reset_and_start_now())
-        menu.append(reset_now)
+        if (
+            self.day_suspended
+            or self.current_session is None
+            or self.waiting_session_start
+            or self.in_midday_recovery
+        ):
+            if self.in_midday_recovery:
+                start_label = "Interrompi la pausa e inizia adesso"
+            elif self.day_suspended:
+                start_label = "Riprendi la giornata adesso"
+            else:
+                start_label = "Inizia a lavorare adesso"
+            start_or_resume = Gtk.MenuItem(label=start_label)
+            start_or_resume.connect("activate", lambda *_: self.request_start_work_now())
+            menu.append(start_or_resume)
 
-        start_break = Gtk.MenuItem(label="Avvia pausa adesso")
-        start_break.connect("activate", lambda *_: self.force_break_now())
-        menu.append(start_break)
+        if self.manual_break or self.in_break or self.waiting_return:
+            pause_item = Gtk.MenuItem(label="Riprendi il lavoro adesso")
+            pause_item.connect("activate", lambda *_: self.resume_work_now())
+        else:
+            pause_item = Gtk.MenuItem(label="Metti in pausa")
+            pause_item.connect("activate", lambda *_: self.request_manual_pause())
+        menu.append(pause_item)
+
+        if (
+            self.current_session is not None
+            and not self.day_suspended
+            and not self.waiting_session_start
+            and not self.waiting_daily_close_choice
+            and not self.in_midday_recovery
+        ):
+            finish_day = Gtk.MenuItem(label="Termina la giornata adesso")
+            finish_day.connect("activate", lambda *_: self.request_finish_day_early())
+            menu.append(finish_day)
 
         if self.compensating_daily_balance:
             finish_now = Gtk.MenuItem(label="Concludi definitivamente adesso")
             finish_now.connect("activate", lambda *_: self.finish_daily_compensation_now())
             menu.append(finish_now)
 
-        summary = Gtk.MenuItem(label="Attività e tempi")
-        summary.connect("activate", lambda *_: self.show_activity_summary())
-        menu.append(summary)
+        menu.append(Gtk.SeparatorMenuItem())
 
-        markdown_item = Gtk.MenuItem(label="Mostra Markdown")
+        markdown_item = Gtk.MenuItem(label="Mostra riepilogo")
         markdown_item.connect("activate", lambda *_: self.show_day_markdown())
         menu.append(markdown_item)
 
-        day_offs = Gtk.MenuItem(label="Ferie, festività e giornate EXTRA")
-        day_offs.connect("activate", lambda *_: self.show_day_off_manager())
-        menu.append(day_offs)
+        menu.append(Gtk.SeparatorMenuItem())
 
         settings = Gtk.MenuItem(label="Impostazioni")
         settings.connect("activate", lambda *_: self.show_settings())
         menu.append(settings)
 
-        autostart_item = Gtk.MenuItem(
-            label="Disabilita avvio automatico" if is_autostart_enabled() else "Abilita avvio automatico"
-        )
-        autostart_item.connect("activate", lambda *_: self.toggle_autostart())
-        menu.append(autostart_item)
-
-        show_window = Gtk.MenuItem(label="Mostra controllo")
-        show_window.connect("activate", lambda *_: self.show_control())
-        menu.append(show_window)
+        menu.append(Gtk.SeparatorMenuItem())
 
         quit_item = Gtk.MenuItem(label="Esci")
         quit_item.connect("activate", lambda *_: self.quit())
@@ -2457,7 +3390,6 @@ class WorkBreakApp:
 
     def show_day_markdown(self, day: Optional[dt.date] = None) -> None:
         selected_day = day or dt.date.today()
-        markdown_text = self.build_day_markdown(selected_day)
         if self.day_markdown_window and self.day_markdown_window.get_visible():
             self.day_markdown_window.destroy()
         parent: Optional[Gtk.Window] = None
@@ -2467,21 +3399,181 @@ class WorkBreakApp:
             parent = self.control_window
         elif self.settings_window and self.settings_window.get_visible():
             parent = self.settings_window
-        self.day_markdown_window = MarkdownPreviewWindow(parent, markdown_text)
+        self.day_markdown_window = DaySummaryWindow(self, selected_day, parent)
 
     def toggle_enabled(self) -> None:
-        self.settings.enabled = not self.settings.enabled
-        self.settings.save()
-        if not self.settings.enabled:
-            self._save_activity_log()
-            self.current_session = None
-            self.current_session_date = None
-            self._reset_runtime_state()
-            self._clear_runtime_state()
+        if self.settings.enabled:
+            self._pause_reminders()
         else:
+            self._request_reminder_reactivation()
+
+    def _hide_runtime_windows_for_reminder_pause(self) -> None:
+        """Chiude gli avvisi operativi senza alterare la macchina a stati."""
+        for attr in (
+            "warning_window",
+            "grace_choice_window",
+            "stop_window",
+            "return_window",
+            "session_window",
+            "activity_window",
+            "break_window",
+            "session_end_window",
+            "midday_recovery_window",
+            "daily_close_window",
+            "compensation_window",
+            "manual_pause_window",
+            "regular_pause_window",
+        ):
+            window = getattr(self, attr, None)
+            try:
+                if window:
+                    window.destroy()
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        self.clock.hide()
+
+    def _persist_runtime_enabled(self) -> None:
+        """Salva solo lo stato attivo senza sovrascrivere opzioni in attesa di riavvio."""
+        persisted = Settings.load()
+        persisted.enabled = self.settings.enabled
+        persisted.save()
+
+    def _pause_reminders(self) -> None:
+        """Congela il timer corrente senza azzerare fase, residui o attività."""
+        if not self.settings.enabled:
+            return
+        self._save_activity_log()
+        # Salva prima lo stato mentre è ancora attivo, poi persiste anche il flag
+        # di pausa. Il payload resta valido anche con settings.enabled=False.
+        self._save_runtime_state(force=True)
+        self.settings.enabled = False
+        self._persist_runtime_enabled()
+        self._hide_runtime_windows_for_reminder_pause()
+        self._save_runtime_state(force=True)
+        self.update_indicator_menu()
+        self._update_ui()
+
+    def _request_reminder_reactivation(self) -> None:
+        if self.settings.enabled:
+            return
+        if self.reminder_reactivation_window and self.reminder_reactivation_window.get_visible():
+            self.reminder_reactivation_window.present()
+            return
+
+        if self.current_session is not None and self.current_session_date == dt.date.today():
+            frozen = self.compact_frozen_timer_text()
+            message = (
+                f"Il promemoria è fermo su {frozen}. Vuoi riprendere esattamente "
+                "dal punto interrotto oppure avviare un nuovo conteggio completo?"
+            )
+        else:
+            message = (
+                "Non c’è un ciclo odierno da riprendere. Puoi comunque riattivare "
+                "il promemoria oppure ricominciare il conteggio nella fascia corrente."
+            )
+
+        self.reminder_reactivation_window = ChoiceAlertWindow(
+            "Riattiva promemoria",
+            message,
+            [
+                ("Continua da dove interrotto", self._continue_frozen_reminders),
+                ("Ricomincia il conteggio", self._restart_reminder_count),
+                ("Annulla", self._cancel_reminder_reactivation),
+            ],
+        )
+
+    def _cancel_reminder_reactivation(self) -> None:
+        self.reminder_reactivation_window = None
+
+    def compact_frozen_timer_text(self) -> str:
+        if self.in_break:
+            return "pausa senza scadenza" if self.manual_break_indefinite else f"pausa {format_mmss(self.break_remaining)}"
+        if self.waiting_return:
+            return f"rientro {format_negative_countdown(self.return_overrun_seconds)}"
+        if self.in_grace:
+            return f"ultimatum {format_mmss(self.grace_remaining)}"
+        if self.in_midday_recovery:
+            value = (
+                format_negative_countdown(self.midday_recovery_overrun_seconds)
+                if self.midday_recovery_overrun_seconds > 0
+                else format_mmss(self.midday_recovery_remaining)
+            )
+            return f"recupero mattutino {value}"
+        if self.in_overtime:
+            return f"lavoro oltre orario +{format_mmss(self.overtime_seconds)}"
+        if self.compensating_daily_balance:
+            return f"compensazione {format_mmss(self.compensation_remaining)}"
+        return f"timer lavoro {format_mmss(self.work_remaining)}"
+
+    def _enable_reminders_base(self) -> dt.datetime:
+        self.reminder_reactivation_window = None
+        self.settings.enabled = True
+        self._persist_runtime_enabled()
+        return dt.datetime.now()
+
+    def _continue_frozen_reminders(self) -> None:
+        """Riprende esattamente fase e residui congelati nello stesso giorno."""
+        now = self._enable_reminders_base()
+        if self.current_session is None or self.current_session_date != now.date():
+            # Uno stato di un giorno precedente non può essere attribuito alla
+            # giornata nuova: in quel caso si applica il normale avvio odierno.
+            self._clear_runtime_state()
+            self._reset_runtime_state()
             self.current_session = None
             self.current_session_date = None
-            self._sync_session(dt.datetime.now(), force=True)
+            self._sync_session(now, force=True)
+        else:
+            self.resume_preserves_cycle = True
+            self._save_runtime_state(force=True)
+            self.update_indicator_menu()
+            self._update_ui()
+            GLib.idle_add(self._restore_pending_runtime_window)
+
+    def _restart_reminder_count(self) -> None:
+        """Azzera la fase congelata e avvia un nuovo ciclo di lavoro."""
+        now = self._enable_reminders_base()
+        previous_session = self.current_session
+        previous_date = self.current_session_date
+        previous_manual_override = self.manual_schedule_override
+        previous_activity = self.current_activity
+        previous_project = self.current_project
+
+        scheduled_session = self.session_for(now)
+        session = scheduled_session
+        if session is None and previous_date == now.date() and previous_session in {"morning", "afternoon"}:
+            # La scelta esplicita di ricominciare consente di ripartire anche se
+            # nel frattempo si è usciti dalla fascia in cui il timer era fermo.
+            session = previous_session
+
+        self._clear_runtime_state()
+        self._reset_runtime_state()
+        self.current_activity = previous_activity
+        self.current_project = previous_project
+        self.current_session = session
+        self.current_session_date = now.date() if session else None
+
+        if session is None:
+            self._sync_session(now, force=True)
+            self.update_indicator_menu()
+            self._update_ui()
+            return
+
+        self.manual_schedule_override = previous_manual_override or scheduled_session != session
+        self.manual_open_ended_work = now >= self._session_boundary(session, now.date(), end=True)
+        self.afternoon_started_early = (
+            session == "afternoon"
+            and now < self._session_boundary("afternoon", now.date(), end=False)
+        )
+        self.resume_preserves_cycle = False
+        self.work_remaining = self._work_cycle_seconds_for_now(now, session)
+        self.waiting_session_start = not bool(self.current_activity)
+        self._mark_day_reopened(now.date())
+        if self.current_activity:
+            self._record_activity(self.current_activity, self.current_project)
+        else:
+            self._show_session_start_prompt(session)
+        self._save_runtime_state(force=True)
         self.update_indicator_menu()
         self._update_ui()
 
@@ -2537,7 +3629,8 @@ class WorkBreakApp:
         self._reset_runtime_state()
         self.current_session = session
         self.current_session_date = now.date()
-        self.work_remaining = self.settings.work_minutes * 60
+        self._mark_day_reopened(now.date())
+        self.work_remaining = self._work_cycle_seconds_for_now(now, session)
         if self.current_activity:
             self.waiting_session_start = False
             self._record_activity(self.current_activity, self.current_project)
@@ -2548,11 +3641,285 @@ class WorkBreakApp:
         self.update_indicator_menu()
         self._update_ui()
 
+    def _manual_session_for_now(self, now: dt.datetime) -> str:
+        morning_end = self._session_boundary("morning", now.date(), end=True)
+        return "morning" if now < morning_end else "afternoon"
+
+    def _mark_day_reopened(self, day: dt.date) -> None:
+        stats = self._stats_for(day)
+        self._ensure_target_snapshot(day, stats)
+        stats["day_closed"] = False
+        stats["close_choice"] = "Giornata riaperta manualmente"
+        stats["balance_delta_seconds"] = None
+        stats["summary_shown"] = False
+        self._save_activity_log()
+
+    def request_start_work_now(self) -> None:
+        if not self.settings.enabled:
+            AlertWindow(
+                "Promemoria disattivato",
+                "Riattiva prima il promemoria per iniziare a lavorare.",
+                "OK",
+            )
+            return
+        if self.in_midday_recovery:
+            self.start_afternoon_from_recovery()
+            return
+        if self.manual_break or self.in_break or self.waiting_return:
+            self.resume_work_now()
+            return
+        if self.waiting_session_start and self.current_session is not None:
+            self._show_session_start_prompt()
+            return
+        if self.current_session is not None and not self.day_suspended:
+            AlertWindow(
+                "Giornata già in corso",
+                "Il conteggio del lavoro è già attivo. Puoi cambiare attività, avviare una pausa manuale oppure terminare la giornata.",
+                "OK",
+            )
+            return
+        if self.activity_window and self.activity_window.get_visible():
+            self.activity_window.present()
+            return
+        now = dt.datetime.now()
+        self.pending_manual_session = self._manual_session_for_now(now)
+        title = "Riprendiamo la giornata?" if self.day_suspended else "Inizia a lavorare adesso"
+        question = (
+            "Cosa stai facendo oggi?"
+            if not self.day_suspended and self.pending_manual_session == "morning"
+            else "Cosa stai facendo adesso?"
+        )
+        self.activity_window = ActivityPromptWindow(
+            title,
+            self.current_activity,
+            self.current_project,
+            self._recent_activity_options(),
+            self._project_suggestions(),
+            self._begin_manual_work,
+            self._dismiss_activity_prompt,
+            activity_question=question,
+        )
+
+    def _begin_manual_work(self, activity: str, project: str) -> None:
+        now = dt.datetime.now()
+        session = self.pending_manual_session or self._manual_session_for_now(now)
+        self.activity_window = None
+        self._reset_runtime_state()
+        self.current_session = session
+        self.current_session_date = now.date()
+        self.manual_schedule_override = True
+        self.afternoon_started_early = (
+            session == "afternoon"
+            and now < self._session_boundary("afternoon", now.date(), end=False)
+        )
+        self.manual_open_ended_work = now >= self._session_boundary(session, now.date(), end=True)
+        self.work_remaining = self._work_cycle_seconds_for_now(now, session)
+        self.waiting_session_start = False
+        self._mark_day_reopened(now.date())
+        self._record_activity(activity, project)
+        self._save_runtime_state(force=True)
+        self.update_indicator_menu()
+        self._update_ui()
+
+    def request_manual_pause(self) -> None:
+        if self.day_suspended:
+            AlertWindow(
+                "Giornata terminata",
+                "Riprendi prima la giornata, poi potrai avviare una pausa manuale.",
+                "OK",
+            )
+            return
+        if self.current_session is None or self.waiting_session_start:
+            AlertWindow(
+                "Lavoro non avviato",
+                "Inizia prima a lavorare con ‘Inizia a lavorare adesso’.",
+                "OK",
+            )
+            return
+        if self.waiting_daily_close_choice or self.compensating_daily_balance or self.in_midday_recovery:
+            AlertWindow(
+                "Azione non disponibile",
+                "Concludi prima la fase corrente, poi potrai avviare una pausa manuale.",
+                "OK",
+            )
+            return
+        if self.waiting_session_end:
+            self._show_session_end_prompt()
+            return
+        if self.manual_break or self.in_break or self.waiting_return:
+            self.resume_work_now()
+            return
+        if self.manual_pause_window and self.manual_pause_window.get_visible():
+            self.manual_pause_window.present()
+            return
+        self.manual_pause_window = ManualPauseWindow(self)
+
+    def start_manual_break(self, minutes: Optional[int]) -> None:
+        if self.current_session is None or self.day_suspended:
+            return
+        for attr in ("grace_choice_window", "stop_window", "warning_window"):
+            window = getattr(self, attr, None)
+            try:
+                if window:
+                    window.destroy()
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        self.waiting_grace_choice = False
+        self.waiting_break_start = False
+        self.in_grace = False
+        self.in_overtime = False
+        self.waiting_session_end = False
+        self.in_break = True
+        self.waiting_return = False
+        self.manual_break = True
+        self.manual_break_indefinite = minutes is None
+        self.break_remaining = 0 if minutes is None else max(1, int(minutes)) * 60
+        self.break_elapsed = 0
+        self.regular_break_credit_remaining = 0
+        self.break_credit_eligible_seconds = 0
+        self.break_planned_seconds = self.break_remaining
+        self.break_credited_seconds = 0
+        self.return_overrun_seconds = 0
+        self.break_truncated_by_day_end = False
+        self._play_beep_once()
+        self._save_runtime_state(force=True)
+        self.update_indicator_menu()
+        self._update_ui()
+
+    def resume_work_now(self) -> None:
+        if self.day_suspended:
+            self.request_start_work_now()
+            return
+        if not (self.manual_break or self.in_break or self.waiting_return):
+            self.request_start_work_now()
+            return
+        self.in_break = False
+        if not self.waiting_return:
+            self.return_overrun_seconds = 0
+        self.waiting_return = True
+        self.break_remaining = 0
+        self._save_runtime_state(force=True)
+        self._show_return_activity_prompt()
+        self.update_indicator_menu()
+        self._update_ui()
+
+    def request_finish_day_early(self) -> None:
+        if self.compensating_daily_balance:
+            self.finish_daily_compensation_now()
+            return
+        if self.waiting_daily_close_choice:
+            self._show_daily_close_choice()
+            return
+        if self.in_midday_recovery:
+            AlertWindow(
+                "Pausa mattutina in corso",
+                "Interrompi o completa prima il recupero della pausa mattutina.",
+                "OK",
+            )
+            return
+        if self.current_session is None or self.day_suspended or self.waiting_session_start:
+            AlertWindow(
+                "Giornata non attiva",
+                "Non c’è una giornata di lavoro già avviata da terminare.",
+                "OK",
+            )
+            return
+        day = self.current_session_date or dt.date.today()
+        remaining = self.balance_remaining_for_day_seconds(day)
+        if self._day_participates_in_balance(day):
+            balance_text = (
+                f"Al momento mancano {format_signed_hours_minutes(remaining)}. "
+                if remaining > 0
+                else "L’obiettivo e il saldo corrente risultano coperti. "
+            )
+        else:
+            balance_text = "Il tempo registrato resterà classificato secondo il tipo di giornata. "
+        ChoiceAlertWindow(
+            "Terminare la giornata adesso?",
+            balance_text
+            + "La giornata verrà fermata immediatamente. Potrai comunque riaprirla più tardi con ‘Riprendi la giornata adesso’.",
+            [
+                ("Termina la giornata", self._finish_day_early),
+                ("Annulla", lambda: None),
+            ],
+        )
+
+    def _finish_day_early(self) -> None:
+        if self.current_session is None:
+            return
+        day = self.current_session_date or dt.date.today()
+        if self.waiting_session_end:
+            pending = max(0, int(self.end_prompt_unaccounted_seconds))
+            if pending:
+                self._record_work_seconds(day, pending, overtime=True)
+                self.overtime_seconds += pending
+        for attr in (
+            "grace_choice_window",
+            "stop_window",
+            "return_window",
+            "session_window",
+            "session_end_window",
+            "manual_pause_window",
+            "regular_pause_window",
+        ):
+            window = getattr(self, attr, None)
+            try:
+                if window:
+                    window.destroy()
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        self.waiting_session_start = False
+        self.waiting_grace_choice = False
+        self.waiting_break_start = False
+        self.in_grace = False
+        self.in_break = False
+        self.waiting_return = False
+        self.waiting_session_end = False
+        self.in_overtime = False
+        self.manual_break = False
+        self.manual_break_indefinite = False
+        self.break_remaining = 0
+        self.break_elapsed = 0
+        self.regular_break_credit_remaining = 0
+        self.break_credit_eligible_seconds = 0
+        self.break_planned_seconds = 0
+        self.break_credited_seconds = 0
+        self.return_overrun_seconds = 0
+        self.end_prompt_wait_seconds = 0
+        self.end_prompt_unaccounted_seconds = 0
+        self.overtime_reminder_remaining = 0
+        self.day_suspended = True
+        self.manual_schedule_override = True
+        self.manual_open_ended_work = False
+        self._finalize_balance_day(day, "Terminata anticipatamente; giornata riapribile")
+        self._save_runtime_state(force=True)
+        self.show_daily_summary(day, mark_shown=True)
+        self.update_indicator_menu()
+        self._update_ui()
+
+    def _manual_work_is_overtime(self, now: dt.datetime) -> bool:
+        if self.current_session is None:
+            return False
+        return now >= self._session_boundary(self.current_session, now.date(), end=True)
+
+    def _record_active_work_second(self, now: dt.datetime) -> None:
+        self._record_work_second(
+            now.date(),
+            overtime=self.manual_open_ended_work or self._manual_work_is_overtime(now),
+        )
+
     def _reset_runtime_state(self) -> None:
         self.work_remaining = self.settings.work_minutes * 60
         self.grace_remaining = 0
         self.break_remaining = 0
         self.break_elapsed = 0
+        self.regular_break_credit_remaining = 0
+        self.break_credit_eligible_seconds = 0
+        self.break_planned_seconds = 0
+        self.break_credited_seconds = 0
+        self.return_overrun_seconds = 0
         self.waiting_session_start = False
         self.waiting_grace_choice = False
         self.waiting_break_start = False
@@ -2569,12 +3936,21 @@ class WorkBreakApp:
         self.in_midday_recovery = False
         self.midday_recovery_remaining = 0
         self.midday_recovery_total = 0
+        self.midday_recovery_overrun_seconds = 0
+        self.midday_recovery_started_late = False
         self.afternoon_started_early = False
         self.waiting_daily_close_choice = False
         self.compensating_daily_balance = False
         self.compensation_remaining = 0
         self.compensation_day = None
         self.break_truncated_by_day_end = False
+        self.manual_break = False
+        self.manual_break_indefinite = False
+        self.manual_schedule_override = False
+        self.manual_open_ended_work = False
+        self.day_suspended = False
+        self.resume_preserves_cycle = False
+        self.pending_manual_session = None
         for window in [
             self.warning_window,
             self.grace_choice_window,
@@ -2587,6 +3963,8 @@ class WorkBreakApp:
             self.midday_recovery_window,
             self.daily_close_window,
             self.compensation_window,
+            self.manual_pause_window,
+            self.regular_pause_window,
         ]:
             try:
                 if window:
@@ -2604,9 +3982,14 @@ class WorkBreakApp:
         self.midday_recovery_window = None
         self.daily_close_window = None
         self.compensation_window = None
+        self.manual_pause_window = None
+        self.regular_pause_window = None
+        self.regular_pause_origin = "stop"
         self.clock.hide()
 
     def _runtime_phase(self) -> str:
+        if self.day_suspended:
+            return "day_suspended"
         if self.compensating_daily_balance:
             return "daily_compensation"
         if self.waiting_daily_close_choice:
@@ -2632,10 +4015,11 @@ class WorkBreakApp:
         return "work"
 
     def _runtime_state_payload(self) -> Optional[dict]:
-        if not self.settings.enabled or self.current_session is None or self.current_session_date is None:
+        if self.current_session is None or self.current_session_date is None:
             return None
         return {
-            "schema_version": 3,
+            "schema_version": 8,
+            "reminders_paused": not self.settings.enabled,
             "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
             "session": self.current_session,
             "session_date": self.current_session_date.isoformat(),
@@ -2644,6 +4028,11 @@ class WorkBreakApp:
             "grace_remaining": max(0, int(self.grace_remaining)),
             "break_remaining": max(0, int(self.break_remaining)),
             "break_elapsed": max(0, int(self.break_elapsed)),
+            "regular_break_credit_remaining": max(0, int(self.regular_break_credit_remaining)),
+            "break_credit_eligible_seconds": max(0, int(self.break_credit_eligible_seconds)),
+            "break_planned_seconds": max(0, int(self.break_planned_seconds)),
+            "break_credited_seconds": max(0, int(self.break_credited_seconds)),
+            "return_overrun_seconds": max(0, int(self.return_overrun_seconds)),
             "overtime_seconds": max(0, int(self.overtime_seconds)),
             "overtime_reminder_remaining": max(0, int(self.overtime_reminder_remaining)),
             "end_prompt_wait_seconds": max(0, int(self.end_prompt_wait_seconds)),
@@ -2651,10 +4040,20 @@ class WorkBreakApp:
             "end_prompt_is_reminder": bool(self.end_prompt_is_reminder),
             "midday_recovery_remaining": max(0, int(self.midday_recovery_remaining)),
             "midday_recovery_total": max(0, int(self.midday_recovery_total)),
+            "midday_recovery_overrun_seconds": max(
+                0, int(self.midday_recovery_overrun_seconds)
+            ),
+            "midday_recovery_started_late": bool(self.midday_recovery_started_late),
             "afternoon_started_early": bool(self.afternoon_started_early),
             "compensation_remaining": max(0, int(self.compensation_remaining)),
             "compensation_day": self.compensation_day.isoformat() if self.compensation_day else "",
             "break_truncated_by_day_end": bool(self.break_truncated_by_day_end),
+            "manual_break": bool(self.manual_break),
+            "manual_break_indefinite": bool(self.manual_break_indefinite),
+            "manual_schedule_override": bool(self.manual_schedule_override),
+            "manual_open_ended_work": bool(self.manual_open_ended_work),
+            "day_suspended": bool(self.day_suspended),
+            "resume_preserves_cycle": bool(self.resume_preserves_cycle),
             "activity": self.current_activity,
             "project": self.current_project,
         }
@@ -2698,14 +4097,14 @@ class WorkBreakApp:
         return max(0, min(parsed, maximum))
 
     def _restore_runtime_state(self, now: dt.datetime) -> bool:
-        if not self.settings.enabled or not RUNTIME_STATE_FILE.exists():
+        if not RUNTIME_STATE_FILE.exists():
             return False
         try:
             raw = json.loads(RUNTIME_STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
             self._clear_runtime_state()
             return False
-        if not isinstance(raw, dict) or int(raw.get("schema_version", 0)) not in (1, 2, 3):
+        if not isinstance(raw, dict) or int(raw.get("schema_version", 0)) not in (1, 2, 3, 4, 5, 6, 7, 8):
             self._clear_runtime_state()
             return False
 
@@ -2723,6 +4122,7 @@ class WorkBreakApp:
             "midday_recovery",
             "waiting_daily_close_choice",
             "daily_compensation",
+            "day_suspended",
         }
         if phase not in valid_phases:
             self._clear_runtime_state()
@@ -2740,10 +4140,22 @@ class WorkBreakApp:
             "midday_recovery",
             "waiting_daily_close_choice",
             "daily_compensation",
+            "day_suspended",
         }
         scheduled_session = self.session_for(now)
         restored_early_afternoon = bool(raw.get("afternoon_started_early", False))
-        if not special_phase and not restored_early_afternoon and scheduled_session != saved_session:
+        restored_manual_override = bool(raw.get("manual_schedule_override", False))
+        restored_manual_break = bool(raw.get("manual_break", False))
+        restored_preserved_cycle = bool(raw.get("resume_preserves_cycle", False))
+        if (
+            self.settings.enabled
+            and not special_phase
+            and not restored_early_afternoon
+            and not restored_manual_override
+            and not restored_manual_break
+            and not restored_preserved_cycle
+            and scheduled_session != saved_session
+        ):
             # Fuori dalla stessa fascia si applica il normale nuovo avvio.
             self._clear_runtime_state()
             return False
@@ -2759,6 +4171,26 @@ class WorkBreakApp:
         self.grace_remaining = self._safe_runtime_seconds(raw.get("grace_remaining", 0))
         self.break_remaining = self._safe_runtime_seconds(raw.get("break_remaining", 0))
         self.break_elapsed = self._safe_runtime_seconds(raw.get("break_elapsed", 0), 7 * 86400)
+        self.regular_break_credit_remaining = self._safe_runtime_seconds(
+            raw.get("regular_break_credit_remaining", 0),
+            self.regular_pause_credit_per_break_seconds(),
+        )
+        self.break_credit_eligible_seconds = self._safe_runtime_seconds(
+            raw.get("break_credit_eligible_seconds", raw.get("break_credited_seconds", 0)),
+            self.regular_pause_credit_per_break_seconds(),
+        )
+        self.break_planned_seconds = self._safe_runtime_seconds(
+            raw.get("break_planned_seconds", self.break_elapsed + self.break_remaining),
+            7 * 86400,
+        )
+        self.break_credited_seconds = self._safe_runtime_seconds(
+            raw.get("break_credited_seconds", 0),
+            7 * 86400,
+        )
+        self.return_overrun_seconds = self._safe_runtime_seconds(
+            raw.get("return_overrun_seconds", 0),
+            7 * 86400,
+        )
         self.overtime_seconds = self._safe_runtime_seconds(raw.get("overtime_seconds", 0), 7 * 86400)
         self.overtime_reminder_remaining = self._safe_runtime_seconds(
             raw.get("overtime_reminder_remaining", self.settings.overtime_reminder_minutes * 60),
@@ -2777,6 +4209,12 @@ class WorkBreakApp:
         self.midday_recovery_total = self._safe_runtime_seconds(
             raw.get("midday_recovery_total", 0), 7 * 86400
         )
+        self.midday_recovery_overrun_seconds = self._safe_runtime_seconds(
+            raw.get("midday_recovery_overrun_seconds", 0), 7 * 86400
+        )
+        self.midday_recovery_started_late = bool(
+            raw.get("midday_recovery_started_late", False)
+        )
         self.afternoon_started_early = restored_early_afternoon
         self.compensation_remaining = self._safe_runtime_seconds(
             raw.get("compensation_remaining", 0), 14 * 86400
@@ -2787,6 +4225,38 @@ class WorkBreakApp:
         except Exception:
             self.compensation_day = now.date()
         self.break_truncated_by_day_end = bool(raw.get("break_truncated_by_day_end", False))
+        self.manual_break = bool(raw.get("manual_break", False))
+        self.manual_break_indefinite = bool(raw.get("manual_break_indefinite", False))
+        if "break_credited_seconds" not in raw:
+            self.break_credited_seconds = (
+                0
+                if self.manual_break
+                else min(
+                    self.break_elapsed,
+                    self.regular_pause_credit_per_break_seconds(),
+                )
+            )
+        if (
+            (
+                "regular_break_credit_remaining" not in raw
+                or "break_credit_eligible_seconds" not in raw
+            )
+            and phase in {"break", "waiting_return"}
+            and not self.manual_break
+        ):
+            # Compatibilità con uno stato salvato dalla versione precedente:
+            # ricostruisce soltanto la quota residua della pausa già iniziata.
+            per_break_remaining = max(
+                0, self.regular_pause_credit_per_break_seconds() - self.break_elapsed
+            )
+            self.break_credit_eligible_seconds = min(
+                self.break_elapsed, self.regular_pause_credit_per_break_seconds()
+            )
+            self.regular_break_credit_remaining = per_break_remaining
+        self.manual_schedule_override = restored_manual_override
+        self.manual_open_ended_work = bool(raw.get("manual_open_ended_work", False))
+        self.day_suspended = bool(raw.get("day_suspended", phase == "day_suspended"))
+        self.resume_preserves_cycle = restored_preserved_cycle
 
         self.waiting_session_start = phase == "waiting_session_start"
         self.waiting_grace_choice = phase == "waiting_grace_choice"
@@ -2799,11 +4269,16 @@ class WorkBreakApp:
         self.in_midday_recovery = phase == "midday_recovery"
         self.waiting_daily_close_choice = phase == "waiting_daily_close_choice"
         self.compensating_daily_balance = phase == "daily_compensation"
+        self._cap_work_cycle_to_session_end(now)
         self._save_runtime_state(force=True)
         return True
 
     def _restore_pending_runtime_window(self) -> bool:
-        if self.compensating_daily_balance:
+        if not self.settings.enabled:
+            return False
+        if self.day_suspended:
+            self.update_indicator_menu()
+        elif self.compensating_daily_balance:
             self._show_daily_compensation_window()
         elif self.waiting_daily_close_choice:
             self._show_daily_close_choice()
@@ -2842,10 +4317,26 @@ class WorkBreakApp:
     def tick(self) -> bool:
         now = dt.datetime.now()
         self._ensure_due_balance_settlements(now.date())
-        self._sync_session(now)
 
-        if not self.settings.enabled or self.current_session is None:
+        if not self.settings.enabled:
+            # Timer e fasi restano completamente congelati finché l'utente non
+            # sceglie come riattivare il promemoria.
             self.clock.hide()
+            self._save_runtime_state()
+            self._update_ui()
+            return True
+
+        self._sync_session(now)
+        self._cap_work_cycle_to_session_end(now)
+
+        if self.current_session is None:
+            self.clock.hide()
+            self._update_ui()
+            return True
+
+        if self.day_suspended:
+            self.clock.hide()
+            self._save_runtime_state()
             self._update_ui()
             return True
 
@@ -2870,11 +4361,18 @@ class WorkBreakApp:
             return True
 
         if self.in_midday_recovery:
+            # Finché non viene confermato il rientro, ogni secondo resta pausa effettiva.
+            self._record_break_second(now.date())
             if self.midday_recovery_remaining > 0:
                 self.midday_recovery_remaining = max(0, self.midday_recovery_remaining - 1)
-                self._record_break_second(now.date())
+            else:
+                self.midday_recovery_overrun_seconds += 1
             if self.midday_recovery_window:
-                self.midday_recovery_window.update(self.midday_recovery_remaining)
+                self.midday_recovery_window.update(
+                    self.midday_recovery_remaining,
+                    self.midday_recovery_overrun_seconds,
+                    self.midday_recovery_started_late,
+                )
             self._save_runtime_state()
             self._update_ui()
             return True
@@ -2907,7 +4405,7 @@ class WorkBreakApp:
         if self.waiting_break_start or self.waiting_grace_choice:
             # Finché l'utente non conferma di essersi realmente fermato, il tempo
             # continua a essere lavoro effettivo attribuito all'attività corrente.
-            self._record_work_second(now.date())
+            self._record_active_work_second(now)
             self.clock.hide()
             self._save_runtime_state()
             self._update_ui()
@@ -2915,20 +4413,47 @@ class WorkBreakApp:
 
         if self.waiting_return:
             # La pausa effettiva termina solo quando l'utente conferma il rientro.
-            self._record_break_second(now.date())
+            # Per una pausa ciclica il ritardo resta abbuonabile fino al tetto
+            # della singola pausa (es. 5 minuti previsti + altri 5 concessi).
+            credit_this_second = (
+                not self.manual_break and self.regular_break_credit_remaining > 0
+            )
+            credited_now = self._record_break_second(
+                now.date(), credited=credit_this_second
+            )
+            if credit_this_second:
+                self.regular_break_credit_remaining = max(
+                    0, self.regular_break_credit_remaining - 1
+                )
+                self.break_credit_eligible_seconds += 1
+                self.break_credited_seconds += credited_now
+            self.break_elapsed += 1
+            self.return_overrun_seconds += 1
+            self._update_return_prompt_timing()
             self._save_runtime_state()
             self._update_ui()
             return True
 
         if self.in_break:
-            self.break_remaining = max(0, self.break_remaining - 1)
+            if not self.manual_break_indefinite:
+                self.break_remaining = max(0, self.break_remaining - 1)
             self.break_elapsed += 1
-            # Solo la pausa entro il countdown configurato concorre all'obiettivo
-            # giornaliero. L'eventuale ritardo successivo resta pausa effettiva,
-            # ma non viene considerato come tempo utile per completare le ore.
-            self._record_break_second(now.date(), credited=True)
+            # Le pause manuali non sono accreditate. Per le pause cicliche
+            # il massimo per singola pausa e per blocco di 2 ore è configurabile.
+            credit_this_second = (
+                not self.manual_break and self.regular_break_credit_remaining > 0
+            )
+            credited_now = self._record_break_second(
+                now.date(), credited=credit_this_second
+            )
+            if credit_this_second:
+                self.regular_break_credit_remaining = max(
+                    0, self.regular_break_credit_remaining - 1
+                )
+                self.break_credit_eligible_seconds += 1
+                self.break_credited_seconds += credited_now
             self._maybe_beep()
-            if self.break_remaining <= 0:
+            if not self.manual_break_indefinite and self.break_remaining <= 0:
                 self._finish_break()
             self._save_runtime_state()
             self._update_ui()
@@ -2936,7 +4461,7 @@ class WorkBreakApp:
 
         if self.in_grace:
             self.grace_remaining = max(0, self.grace_remaining - 1)
-            self._record_work_second(now.date())
+            self._record_active_work_second(now)
             if self.grace_remaining <= 0:
                 self._show_stop_alert()
             self._save_runtime_state()
@@ -2944,8 +4469,9 @@ class WorkBreakApp:
             return True
 
         self.work_remaining = max(0, self.work_remaining - 1)
-        self._record_work_second(now.date())
+        self._record_active_work_second(now)
         if self.work_remaining <= 0:
+            self.resume_preserves_cycle = False
             self._show_grace_choice()
 
         self._save_runtime_state()
@@ -2986,16 +4512,55 @@ class WorkBreakApp:
         afternoon_start = self._session_boundary("afternoon", day, end=False)
         return max(0, int((afternoon_start - morning_end).total_seconds()))
 
+    def _work_cycle_seconds_for_now(
+        self, now: Optional[dt.datetime] = None, session: Optional[str] = None
+    ) -> int:
+        """Limita il ciclo al tempo reale rimasto prima della fine fascia.
+
+        Se, per esempio, il ciclo configurato è 60 minuti ma mancano soltanto
+        22 minuti a ``Mattina fine``, il countdown deve partire da 22 minuti.
+        Fuori dall'orario di fine (lavoro manuale aperto) resta invece valido
+        l'intero ciclo configurato.
+        """
+        current = now or dt.datetime.now()
+        selected = session or self.current_session
+        configured = max(1, int(self.settings.work_minutes)) * 60
+        if selected not in {"morning", "afternoon"}:
+            return configured
+
+        boundary = self._session_boundary(selected, current.date(), end=True)
+        seconds_to_end = int(math.ceil((boundary - current).total_seconds()))
+        if seconds_to_end <= 0:
+            return configured
+        return max(1, min(configured, seconds_to_end))
+
+    def _cap_work_cycle_to_session_end(self, now: Optional[dt.datetime] = None) -> None:
+        """Applica il limite anche agli stati ripristinati da versioni precedenti."""
+        current = now or dt.datetime.now()
+        if (
+            self.current_session not in {"morning", "afternoon"}
+            or self.current_session_date != current.date()
+            or self.manual_open_ended_work
+            or self.in_overtime
+            or self.waiting_session_end
+            or self.compensating_daily_balance
+            or self.resume_preserves_cycle
+            or not self.settings.enabled
+        ):
+            return
+        maximum = self._work_cycle_seconds_for_now(current, self.current_session)
+        if self.work_remaining > maximum:
+            self.work_remaining = maximum
+
     def _sync_session(self, now: dt.datetime, force: bool = False) -> None:
         if not self.settings.enabled:
-            if self.current_session is not None:
-                self._clear_runtime_state()
-                self._reset_runtime_state()
-                self.current_session = None
-                self.current_session_date = None
+            # Disattivare i promemoria congela la macchina a stati: non deve
+            # cancellare né azzerare il timer corrente.
             return
 
         if self.current_session is not None and self.current_session_date == now.date():
+            if self.day_suspended or self.manual_break or self.manual_open_ended_work:
+                return
             if self.in_midday_recovery or self.waiting_session_end or self.in_overtime:
                 return
             if self.waiting_daily_close_choice or self.compensating_daily_balance:
@@ -3010,6 +4575,9 @@ class WorkBreakApp:
                 return
 
             if self.current_session == "afternoon" and self.afternoon_started_early:
+                return
+
+            if self.manual_schedule_override and now < session_end:
                 return
 
             if not force and self.session_for(now) == self.current_session:
@@ -3033,10 +4601,13 @@ class WorkBreakApp:
         self.current_session_date = now.date() if new_session is not None else None
 
         if old_session == "afternoon" and new_session != "afternoon":
-            self.show_daily_summary(old_session_date or now.date(), mark_shown=True)
+            summary_day = old_session_date or now.date()
+            summary_stats = self.activity_log.get("days", {}).get(summary_day.isoformat(), {})
+            if not bool(summary_stats.get("summary_shown", False)):
+                self.show_daily_summary(summary_day, mark_shown=True)
 
         if new_session is not None:
-            self.work_remaining = self.settings.work_minutes * 60
+            self.work_remaining = self._work_cycle_seconds_for_now(now, new_session)
             self.waiting_session_start = True
             self._show_session_start_prompt(new_session)
             self._save_runtime_state(force=True)
@@ -3083,7 +4654,7 @@ class WorkBreakApp:
             self._finish_session_end(explicit=False)
             return
 
-        self._play_beep_once()
+        self._play_timer_end_sound()
         self._show_session_end_prompt()
         self._save_runtime_state(force=True)
         self._update_ui()
@@ -3182,9 +4753,19 @@ class WorkBreakApp:
             residual = max(0, int(self.break_remaining))
             self.break_remaining = 0
             self.break_elapsed += residual
-            self._record_break_seconds(day, residual, credited=True)
+            creditable = min(residual, max(0, int(self.regular_break_credit_remaining)))
+            if creditable > 0:
+                credited_now = self._record_break_seconds(day, creditable, credited=True)
+                self.break_credit_eligible_seconds += creditable
+                self.break_credited_seconds += credited_now
+            if residual > creditable:
+                self._record_break_seconds(day, residual - creditable, credited=False)
+            self.regular_break_credit_remaining = 0
         self.in_break = False
         self.waiting_return = False
+        self.break_planned_seconds = 0
+        self.break_credited_seconds = 0
+        self.return_overrun_seconds = 0
         self.break_truncated_by_day_end = False
         for attr in ("return_window", "break_window"):
             window = getattr(self, attr, None)
@@ -3208,6 +4789,13 @@ class WorkBreakApp:
         self.end_prompt_unaccounted_seconds = 0
         self.overtime_reminder_remaining = 0
         self.break_truncated_by_day_end = False
+        self.break_remaining = 0
+        self.break_elapsed = 0
+        self.regular_break_credit_remaining = 0
+        self.break_credit_eligible_seconds = 0
+        self.break_planned_seconds = 0
+        self.break_credited_seconds = 0
+        self.return_overrun_seconds = 0
         self.compensation_day = day
         self.clock.hide()
 
@@ -3334,8 +4922,25 @@ class WorkBreakApp:
             )
 
     def _start_midday_recovery(self, day: dt.date, elapsed_break_seconds: int = 0) -> None:
-        total = self._midday_break_seconds(day)
+        now = dt.datetime.now()
+        morning_end = self._session_boundary("morning", day, end=True)
+        afternoon_start = self._session_boundary("afternoon", day, end=False)
+        scheduled_pause_seconds = max(
+            0, int(math.ceil((afternoon_start - morning_end).total_seconds()))
+        )
         elapsed = max(0, int(elapsed_break_seconds))
+        # Nei timeout automatici una parte della pausa è già trascorsa prima di aprire la finestra.
+        actual_pause_start = now - dt.timedelta(seconds=elapsed)
+        started_late = actual_pause_start > morning_end
+        if started_late:
+            expected_return = actual_pause_start + dt.timedelta(
+                seconds=scheduled_pause_seconds
+            )
+        else:
+            expected_return = afternoon_start
+
+        remaining = max(0, int(math.ceil((expected_return - now).total_seconds())))
+        overrun = max(0, int(math.floor((now - expected_return).total_seconds())))
         if elapsed:
             self._record_break_seconds(day, elapsed)
 
@@ -3343,8 +4948,10 @@ class WorkBreakApp:
         self.current_session = "morning"
         self.current_session_date = day
         self.in_midday_recovery = True
-        self.midday_recovery_total = total
-        self.midday_recovery_remaining = max(0, total - elapsed)
+        self.midday_recovery_total = remaining
+        self.midday_recovery_remaining = remaining
+        self.midday_recovery_overrun_seconds = overrun
+        self.midday_recovery_started_late = started_late
         self._show_midday_recovery_window()
         self._save_runtime_state(force=True)
         self.update_indicator_menu()
@@ -3352,11 +4959,19 @@ class WorkBreakApp:
 
     def _show_midday_recovery_window(self) -> None:
         if self.midday_recovery_window and self.midday_recovery_window.get_visible():
-            self.midday_recovery_window.update(self.midday_recovery_remaining)
+            self.midday_recovery_window.update(
+                self.midday_recovery_remaining,
+                self.midday_recovery_overrun_seconds,
+                self.midday_recovery_started_late,
+            )
             self.midday_recovery_window.present()
             return
         self.midday_recovery_window = MiddayRecoveryWindow(self)
-        self.midday_recovery_window.update(self.midday_recovery_remaining)
+        self.midday_recovery_window.update(
+            self.midday_recovery_remaining,
+            self.midday_recovery_overrun_seconds,
+            self.midday_recovery_started_late,
+        )
 
     def start_afternoon_from_recovery(self) -> None:
         if not self.in_midday_recovery:
@@ -3371,10 +4986,12 @@ class WorkBreakApp:
         self.in_midday_recovery = False
         self.midday_recovery_remaining = 0
         self.midday_recovery_total = 0
+        self.midday_recovery_overrun_seconds = 0
+        self.midday_recovery_started_late = False
         self.current_session = "afternoon"
         self.current_session_date = now.date()
         self.afternoon_started_early = now < self._session_boundary("afternoon", now.date(), end=False)
-        self.work_remaining = self.settings.work_minutes * 60
+        self.work_remaining = self._work_cycle_seconds_for_now(now, "afternoon")
         self.waiting_session_start = False
         if self.current_activity:
             self._record_activity(self.current_activity, self.current_project)
@@ -3418,7 +5035,12 @@ class WorkBreakApp:
     def _begin_session(self, activity: str, project: str) -> None:
         self.session_window = None
         self.waiting_session_start = False
-        self.work_remaining = self.settings.work_minutes * 60
+        self.manual_schedule_override = False
+        self.manual_open_ended_work = False
+        self.day_suspended = False
+        self.work_remaining = self._work_cycle_seconds_for_now(
+            dt.datetime.now(), self.current_session
+        )
         self._record_activity(activity, project)
         self._save_runtime_state(force=True)
         self._update_ui()
@@ -3477,7 +5099,7 @@ class WorkBreakApp:
         self.waiting_grace_choice = True
         self.work_remaining = 0
         if not restoring:
-            self._play_beep_once()
+            self._play_timer_end_sound()
         default_seconds = self.settings.warning_seconds
         default_label = f"Predefinito: {format_mmss(default_seconds)}"
         self.grace_choice_window = ChoiceAlertWindow(
@@ -3487,6 +5109,7 @@ class WorkBreakApp:
                 (default_label, lambda: self._start_grace(default_seconds)),
                 ("5 minuti", lambda: self._start_grace(5 * 60)),
                 ("10 minuti", lambda: self._start_grace(10 * 60)),
+                ("Inizia subito la pausa…", self._start_break_immediately),
             ],
         )
         self._save_runtime_state(force=True)
@@ -3500,6 +5123,15 @@ class WorkBreakApp:
         self._save_runtime_state(force=True)
         self._update_ui()
 
+    def _start_break_immediately(self) -> None:
+        """Salta l’ultimatum e chiede subito la durata della pausa ciclica."""
+        self.grace_choice_window = None
+        self.in_grace = False
+        self.grace_remaining = 0
+        # Manteniamo waiting_grace_choice finché la durata non viene confermata:
+        # il lavoro continua quindi a essere conteggiato durante la scelta.
+        self._request_regular_pause_duration("grace")
+
     def _show_stop_alert(self, immediate: bool = False, restoring: bool = False) -> None:
         self.in_grace = False
         self.waiting_grace_choice = False
@@ -3507,7 +5139,7 @@ class WorkBreakApp:
         self.grace_remaining = 0
         self.clock.hide()
         if not restoring:
-            self._play_beep_once()
+            self._play_timer_end_sound()
         try:
             if self.warning_window:
                 self.warning_window.destroy()
@@ -3525,16 +5157,54 @@ class WorkBreakApp:
         prefix = "Pausa avviata manualmente." if immediate else "Il tempo scelto è terminato."
         self.stop_window = AlertWindow(
             "Fermati subito!",
-            f"{prefix}\nAlzati ora: quando premi il pulsante parte il tempo di pausa, visibile nella barra di sistema.",
-            "Ho iniziato la pausa",
-            self.start_break,
+            f"{prefix}\nIl lavoro continua finché non scegli la durata e avvii realmente la pausa.",
+            "Scegli durata pausa",
+            lambda: self._request_regular_pause_duration("stop"),
         )
         self._save_runtime_state(force=True)
 
+    def _request_regular_pause_duration(self, origin: str) -> None:
+        if self.regular_pause_window and self.regular_pause_window.get_visible():
+            self.regular_pause_window.present()
+            return
+        self.regular_pause_origin = origin if origin in {"grace", "stop"} else "stop"
+        self.stop_window = None
+        self.regular_pause_window = RegularPauseWindow(self)
+        self._save_runtime_state(force=True)
+
+    def _cancel_regular_pause_choice(self) -> bool:
+        origin = self.regular_pause_origin
+        self.regular_pause_origin = "stop"
+        if origin == "grace":
+            self.waiting_grace_choice = True
+            self.waiting_break_start = False
+            self._show_grace_choice(restoring=True)
+        else:
+            self.waiting_grace_choice = False
+            self.waiting_break_start = True
+            self._show_stop_alert(restoring=True)
+        self._save_runtime_state(force=True)
+        self._update_ui()
+        return False
+
     def start_break(self) -> None:
+        """Compatibilità: apre la scelta della durata della pausa ciclica."""
+        origin = "grace" if self.waiting_grace_choice else "stop"
+        self._request_regular_pause_duration(origin)
+
+    def _begin_regular_break(self, minutes: int) -> None:
+        # La pausa parte solo dopo la scelta esplicita della durata.
+        self.waiting_grace_choice = False
         self.waiting_break_start = False
+        self.in_grace = False
+        self.grace_remaining = 0
+        self.grace_choice_window = None
+        self.regular_pause_window = None
+        self.regular_pause_origin = "stop"
         self.in_break = True
-        configured_break = self.settings.break_minutes * 60
+        self.manual_break = False
+        self.manual_break_indefinite = False
+        configured_break = max(1, int(minutes)) * 60
         self.break_truncated_by_day_end = False
         if self.current_session == "afternoon" and self.current_session_date == dt.date.today():
             seconds_to_close = max(
@@ -3556,13 +5226,21 @@ class WorkBreakApp:
         else:
             self.break_remaining = configured_break
         self.break_elapsed = 0
+        self.break_planned_seconds = self.break_remaining
+        self.break_credited_seconds = 0
+        self.break_credit_eligible_seconds = 0
+        self.return_overrun_seconds = 0
+        # Il tetto della singola pausa resta disponibile anche dopo la durata
+        # scelta: per esempio una pausa prevista da 5 minuti può abbuonare altri
+        # 5 minuti di ritardo, fino al massimo configurato di 10 minuti.
+        self.regular_break_credit_remaining = self.regular_pause_credit_per_break_seconds()
         try:
             if self.stop_window:
                 self.stop_window.destroy()
         except Exception:
             pass
         self.stop_window = None
-        # Nessuna finestra countdown: il tempo resta sempre accanto all'icona.
+        # Nessuna finestra countdown: il tempo resta sempre accanto all’icona.
         self.break_window = None
         self._play_beep_once()
         if self.break_remaining <= 0 and self.current_session == "afternoon":
@@ -3576,17 +5254,56 @@ class WorkBreakApp:
         if self.break_truncated_by_day_end and self.current_session == "afternoon":
             self.in_break = False
             self.break_remaining = 0
+            self.regular_break_credit_remaining = 0
             self._prepare_end_of_day(self.current_session_date or dt.date.today(), explicit=True)
             return
         self.in_break = False
         self.waiting_return = True
         self.break_remaining = 0
-        self._play_beep_once()
+        # La quota residua della singola pausa resta disponibile durante il
+        # messaggio di rientro, così un piccolo ritardo può essere abbuonato.
+        self.return_overrun_seconds = 0
+        self._play_timer_end_sound()
         self._save_runtime_state(force=True)
         self._show_return_activity_prompt()
 
+    def _return_break_info_lines(self) -> list[str]:
+        elapsed = max(0, int(self.break_elapsed))
+        planned = max(0, int(self.break_planned_seconds))
+        credited = max(0, min(int(self.break_credited_seconds), elapsed))
+        overrun = max(0, int(self.return_overrun_seconds))
+        non_credited = max(0, elapsed - credited)
+
+        planned_text = "senza scadenza" if self.manual_break_indefinite else format_mmss(planned)
+        lines = [f"Pausa prevista: {planned_text} · effettiva finora: {format_mmss(elapsed)}"]
+        if self.manual_break:
+            lines.extend(
+                [
+                    f"Pausa terminata da: {format_negative_countdown(overrun)}",
+                    "Pausa manuale: nessun minuto è abbuonato nell’obiettivo giornaliero.",
+                    f"Tempo da recuperare per questa pausa: {format_negative_countdown(non_credited)}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"Quota abbuonata utilizzata: {format_mmss(credited)}",
+                    f"Pausa terminata da: {format_negative_countdown(overrun)}",
+                    (
+                        f"Sforamento oltre i {format_mmss(credited)} abbuonati: "
+                        f"{format_negative_countdown(non_credited)}"
+                    ),
+                ]
+            )
+        return lines
+
+    def _update_return_prompt_timing(self) -> None:
+        if isinstance(self.return_window, ActivityPromptWindow):
+            self.return_window.update_info_lines(self._return_break_info_lines())
+
     def _show_return_activity_prompt(self) -> None:
         if self.return_window and self.return_window.get_visible():
+            self._update_return_prompt_timing()
             self.return_window.present()
             return
         self.return_window = ActivityPromptWindow(
@@ -3597,6 +5314,7 @@ class WorkBreakApp:
             self._project_suggestions(),
             self.returned_from_break,
             self._defer_return,
+            info_lines=self._return_break_info_lines(),
         )
 
     def _defer_return(self) -> None:
@@ -3606,9 +5324,31 @@ class WorkBreakApp:
         self._update_ui()
 
     def returned_from_break(self, activity: str, project: str) -> None:
+        was_manual_break = self.manual_break
+        now = dt.datetime.now()
         self.waiting_return = False
-        self.work_remaining = self.settings.work_minutes * 60
+        self.in_break = False
+        self.manual_break = False
+        self.manual_break_indefinite = False
+        if was_manual_break:
+            self.current_session = self._manual_session_for_now(now)
+            self.current_session_date = now.date()
+            self.manual_schedule_override = True
+            self.afternoon_started_early = (
+                self.current_session == "afternoon"
+                and now < self._session_boundary("afternoon", now.date(), end=False)
+            )
+            self.manual_open_ended_work = now >= self._session_boundary(
+                self.current_session, now.date(), end=True
+            )
+            self._mark_day_reopened(now.date())
+        self.work_remaining = self._work_cycle_seconds_for_now(now, self.current_session)
         self.break_elapsed = 0
+        self.regular_break_credit_remaining = 0
+        self.break_credit_eligible_seconds = 0
+        self.break_planned_seconds = 0
+        self.break_credited_seconds = 0
+        self.return_overrun_seconds = 0
         try:
             if self.return_window:
                 self.return_window.destroy()
@@ -3617,6 +5357,7 @@ class WorkBreakApp:
         self.return_window = None
         self._record_activity(activity, project)
         self._save_runtime_state(force=True)
+        self.update_indicator_menu()
         self._update_ui()
 
     def _maybe_beep(self) -> None:
@@ -3630,34 +5371,62 @@ class WorkBreakApp:
             if beep_index < s.beep_count:
                 self._play_beep_once()
 
-    def _build_beep_file(self) -> Path:
-        path = Path(tempfile.gettempdir()) / f"{APP_ID}-soft-beep.wav"
+    def _build_sound_file(self, sound_key: str) -> Path:
+        sound_key = sound_key if sound_key in TIMER_END_SOUND_OPTIONS else "soft"
+        cache_key = f"{sound_key}-{int(self.settings.beep_volume * 100)}"
+        cached = self.sound_files.get(cache_key) if hasattr(self, "sound_files") else None
+        if cached and cached.exists():
+            return cached
+
+        path = Path(tempfile.gettempdir()) / f"{APP_ID}-{cache_key}.wav"
         rate = 44100
-        duration = 0.18
-        freq = 740.0
         amplitude = max(0.01, min(self.settings.beep_volume, 0.30))
-        samples = int(rate * duration)
+
+        if sound_key == "double":
+            segments = [(760.0, 0.15), (0.0, 0.10), (900.0, 0.18)]
+        elif sound_key == "chime":
+            segments = [(660.0, 0.20), (880.0, 0.24), (1100.0, 0.30)]
+        else:
+            segments = [(740.0, 0.18)]
+
+        frames = bytearray()
+        for frequency, duration in segments:
+            samples = max(1, int(rate * duration))
+            for i in range(samples):
+                if frequency <= 0:
+                    value = 0
+                else:
+                    fade_in = min(1.0, i / max(1, int(rate * 0.020)))
+                    fade_out = min(1.0, (samples - i) / max(1, int(rate * 0.045)))
+                    env = max(0.0, min(fade_in, fade_out))
+                    if sound_key == "chime":
+                        tone = (
+                            math.sin(2 * math.pi * frequency * i / rate)
+                            + 0.35 * math.sin(2 * math.pi * frequency * 2 * i / rate)
+                        ) / 1.35
+                    else:
+                        tone = math.sin(2 * math.pi * frequency * i / rate)
+                    value = int(32767 * amplitude * env * tone)
+                frames.extend(value.to_bytes(2, byteorder="little", signed=True))
+
         with wave.open(str(path), "w") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(rate)
-            frames = bytearray()
-            for i in range(samples):
-                env = min(i / (rate * 0.025), 1.0, (samples - i) / (rate * 0.040))
-                val = int(32767 * amplitude * env * math.sin(2 * math.pi * freq * i / rate))
-                frames.extend(val.to_bytes(2, byteorder="little", signed=True))
             wav.writeframes(bytes(frames))
+        if hasattr(self, "sound_files"):
+            self.sound_files[cache_key] = path
         return path
 
-    def _play_beep_once(self) -> None:
-        if not self.settings.audio_enabled:
+    def _play_sound(self, sound_key: str) -> None:
+        if not self.settings.audio_enabled or sound_key == "none":
             return
-        self.beep_file = self._build_beep_file()
+        sound_file = self._build_sound_file(sound_key)
         player = shutil.which("paplay") or shutil.which("aplay")
         if player:
             try:
                 subprocess.Popen(
-                    [player, str(self.beep_file)],
+                    [player, str(sound_file)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
@@ -3670,9 +5439,21 @@ class WorkBreakApp:
         except Exception:
             pass
 
+    def _play_timer_end_sound(self) -> None:
+        self._play_sound(self.settings.timer_end_sound)
+
+    def _build_beep_file(self) -> Path:
+        # Alias mantenuto per compatibilità interna con versioni precedenti.
+        return self._build_sound_file("soft")
+
+    def _play_beep_once(self) -> None:
+        # I beep periodici della pausa restano volutamente morbidi.
+        self.beep_file = self._build_sound_file("soft")
+        self._play_sound("soft")
+
     def _load_activity_log(self) -> dict:
         raw: dict = {
-            "schema_version": 5,
+            "schema_version": 6,
             "days": {},
             "projects": {},
             "balance_enabled_from": dt.date.today().isoformat(),
@@ -3685,7 +5466,11 @@ class WorkBreakApp:
         except Exception:
             pass
 
-        raw["schema_version"] = 5
+        try:
+            previous_schema = int(raw.get("schema_version", 0) or 0)
+        except Exception:
+            previous_schema = 0
+        raw["schema_version"] = 6
         raw.setdefault("days", {})
         if not isinstance(raw.get("balance_settlements"), dict):
             raw["balance_settlements"] = {}
@@ -3711,6 +5496,29 @@ class WorkBreakApp:
             stats.setdefault("work_seconds", 0)
             stats.setdefault("break_seconds", 0)
             stats.setdefault("credited_break_seconds", 0)
+            if "regular_break_eligible_seconds" not in stats:
+                legacy_credited = max(0, int(stats.get("credited_break_seconds", 0)))
+                legacy_eligible = legacy_credited
+                # Le versioni precedenti non conservavano i secondi regolari eccedenti.
+                # Solo per la giornata corrente ancora aperta recuperiamo, in modo
+                # prudente, fino all'abbuono extra giornaliero configurato.
+                try:
+                    legacy_day = dt.date.fromisoformat(day_key)
+                except Exception:
+                    legacy_day = None
+                if (
+                    previous_schema < 6
+                    and legacy_day == dt.date.today()
+                    and not bool(stats.get("day_closed", False))
+                ):
+                    unclassified_break = max(
+                        0, int(stats.get("break_seconds", 0)) - legacy_credited
+                    )
+                    legacy_eligible += min(
+                        unclassified_break,
+                        max(0, int(self.settings.daily_pause_extra_credit_minutes)) * 60,
+                    )
+                stats["regular_break_eligible_seconds"] = legacy_eligible
             stats.setdefault("overtime_seconds", 0)
             stats.setdefault("special_workday", False)
             stats.setdefault("special_workday_label", "")
@@ -3749,6 +5557,16 @@ class WorkBreakApp:
                             "name": project,
                             "last_used": max(str(current.get("last_used", "")), str(item.get("last_used", ""))),
                         }
+            classified_work = sum(
+                max(0, int(item.get("work_seconds", 0)))
+                for item in stats.get("activity_totals", [])
+                if isinstance(item, dict)
+            )
+            stats["work_seconds"] = max(
+                max(0, int(stats.get("work_seconds", 0))),
+                max(0, int(stats.get("overtime_seconds", 0))),
+                classified_work,
+            )
         return raw
 
     def _save_activity_log(self) -> None:
@@ -3794,6 +5612,10 @@ class WorkBreakApp:
         stats.setdefault("work_seconds", 0)
         stats.setdefault("break_seconds", 0)
         stats.setdefault("credited_break_seconds", 0)
+        stats.setdefault(
+            "regular_break_eligible_seconds",
+            max(0, int(stats.get("credited_break_seconds", 0))),
+        )
         stats.setdefault("overtime_seconds", 0)
         stats.setdefault("special_workday", False)
         stats.setdefault("special_workday_label", "")
@@ -3851,11 +5673,83 @@ class WorkBreakApp:
             return stored
         return self._base_nonworking_reason(day) or "Giornata non lavorativa"
 
+    def regular_pause_credit_per_break_seconds(self) -> int:
+        """Massimo configurato che una singola pausa ciclica può abbuonare."""
+        return max(0, int(self.settings.regular_pause_credit_minutes)) * 60
+
+    def regular_pause_base_credit_limit_seconds(
+        self, day: dt.date, stats: Optional[dict] = None
+    ) -> int:
+        """Quota ordinaria maturata: valore configurato per ogni blocco iniziato di 2 ore."""
+        stats = stats or self.activity_log.get("days", {}).get(day.isoformat(), {})
+        work = max(0, int(stats.get("work_seconds", 0)))
+        credit_per_block = self.regular_pause_credit_per_break_seconds()
+        if work <= 0 or credit_per_block <= 0:
+            return 0
+        blocks = max(
+            1,
+            (work + REGULAR_PAUSE_WORK_BLOCK_SECONDS - 1)
+            // REGULAR_PAUSE_WORK_BLOCK_SECONDS,
+        )
+        return blocks * credit_per_block
+
+    def regular_pause_credit_limit_seconds(
+        self, day: dt.date, stats: Optional[dict] = None
+    ) -> int:
+        """Tetto giornaliero: quota ordinaria maturata + abbuono extra giornaliero."""
+        stats = stats or self.activity_log.get("days", {}).get(day.isoformat(), {})
+        work = max(0, int(stats.get("work_seconds", 0)))
+        if work <= 0:
+            return 0
+        base = self.regular_pause_base_credit_limit_seconds(day, stats)
+        extra = max(0, int(self.settings.daily_pause_extra_credit_minutes)) * 60
+        return base + extra
+
+    def credited_break_for_day_seconds(
+        self, day: dt.date, stats: Optional[dict] = None
+    ) -> int:
+        stats = stats or self.activity_log.get("days", {}).get(day.isoformat(), {})
+        stored = max(0, int(stats.get("credited_break_seconds", 0)))
+        eligible = max(
+            stored,
+            max(0, int(stats.get("regular_break_eligible_seconds", stored))),
+        )
+        credited = min(eligible, self.regular_pause_credit_limit_seconds(day, stats))
+        if isinstance(stats, dict):
+            stats["regular_break_eligible_seconds"] = eligible
+            stats["credited_break_seconds"] = credited
+        return credited
+
+    def regular_pause_credit_available_seconds(self, day: dt.date) -> int:
+        stats = self.activity_log.get("days", {}).get(day.isoformat(), {})
+        return max(
+            0,
+            self.regular_pause_credit_limit_seconds(day, stats)
+            - self.credited_break_for_day_seconds(day, stats),
+        )
+
+    def _recalculate_pause_credits(self) -> None:
+        changed = False
+        for day_key, stats in self.activity_log.get("days", {}).items():
+            if not isinstance(stats, dict):
+                continue
+            try:
+                day = dt.date.fromisoformat(day_key)
+            except Exception:
+                continue
+            before = max(0, int(stats.get("credited_break_seconds", 0)))
+            after = self.credited_break_for_day_seconds(day, stats)
+            if before != after:
+                changed = True
+            self._refresh_closed_balance_delta(day)
+        if changed:
+            self._save_activity_log()
+
     def daily_counted_seconds(self, day: dt.date) -> int:
         """Tempo utile per l'obiettivo: lavoro + sola pausa terminata entro il countdown."""
         stats = self.activity_log.get("days", {}).get(day.isoformat(), {})
         work = max(0, int(stats.get("work_seconds", 0)))
-        credited_break = max(0, int(stats.get("credited_break_seconds", 0)))
+        credited_break = self.credited_break_for_day_seconds(day, stats)
         return work + credited_break
 
     def _balance_activation_day(self) -> dt.date:
@@ -4046,7 +5940,7 @@ class WorkBreakApp:
             stats = self.activity_log.get("days", {}).get(cursor.isoformat(), {})
             if not self._is_special_workday(cursor, stats):
                 total += max(0, int(stats.get("work_seconds", 0)))
-                total += max(0, int(stats.get("credited_break_seconds", 0)))
+                total += self.credited_break_for_day_seconds(cursor, stats)
             cursor += dt.timedelta(days=1)
         return total
 
@@ -4178,6 +6072,10 @@ class WorkBreakApp:
         stats["work_seconds"] = int(stats.get("work_seconds", 0)) + seconds
         if overtime:
             stats["overtime_seconds"] = int(stats.get("overtime_seconds", 0)) + seconds
+        # Aumentando il lavoro possono maturare nuovi blocchi di pausa: eventuali
+        # secondi regolari già idonei vengono abbuonati retroattivamente fino al
+        # nuovo tetto giornaliero.
+        stats["credited_break_seconds"] = self.credited_break_for_day_seconds(day, stats)
         stats["summary_shown"] = False
         if self.current_activity:
             item = self._activity_total_entry(stats, self.current_activity, self.current_project)
@@ -4192,18 +6090,32 @@ class WorkBreakApp:
         if self.summary_window and self.summary_window.get_visible() and self.stats_save_counter % 5 == 0:
             self.summary_window.refresh()
 
-    def _record_break_second(self, day: dt.date, credited: bool = False) -> None:
-        self._record_break_seconds(day, 1, credited=credited)
+    def _record_break_second(self, day: dt.date, credited: bool = False) -> int:
+        return self._record_break_seconds(day, 1, credited=credited)
 
-    def _record_break_seconds(self, day: dt.date, seconds: int, credited: bool = False) -> None:
+    def _record_break_seconds(
+        self, day: dt.date, seconds: int, credited: bool = False
+    ) -> int:
+        """Registra la pausa e restituisce quanti secondi sono diventati utili all'obiettivo.
+
+        ``credited`` indica che i secondi appartengono a una pausa ciclica ancora
+        entro il tetto della singola pausa. Vengono conservati come idonei anche
+        se il tetto giornaliero è momentaneamente esaurito: lavorando ancora, la
+        quota ordinaria può maturare e accreditarli successivamente.
+        """
         seconds = max(0, int(seconds))
         if seconds <= 0:
-            return
+            return 0
         stats = self._stats_for(day)
         self._ensure_target_snapshot(day, stats)
+        before_credit = self.credited_break_for_day_seconds(day, stats)
         stats["break_seconds"] = int(stats.get("break_seconds", 0)) + seconds
         if credited:
-            stats["credited_break_seconds"] = int(stats.get("credited_break_seconds", 0)) + seconds
+            stats["regular_break_eligible_seconds"] = max(
+                0, int(stats.get("regular_break_eligible_seconds", 0))
+            ) + seconds
+        after_credit = self.credited_break_for_day_seconds(day, stats)
+        stats["credited_break_seconds"] = after_credit
         stats["summary_shown"] = False
         self._refresh_closed_balance_delta(day)
         if seconds == 1:
@@ -4212,6 +6124,7 @@ class WorkBreakApp:
             self._save_activity_log()
         if self.summary_window and self.summary_window.get_visible() and self.stats_save_counter % 5 == 0:
             self.summary_window.refresh()
+        return max(0, after_credit - before_credit)
 
     def _remember_project(self, project: str) -> None:
         project = project.strip()
@@ -4549,7 +6462,9 @@ class WorkBreakApp:
 
         work = self._format_effective_minutes(int(stats.get("work_seconds", 0)))
         pause = self._format_effective_minutes(int(stats.get("break_seconds", 0)))
-        credited_pause = self._format_effective_minutes(int(stats.get("credited_break_seconds", 0)))
+        credited_pause = self._format_effective_minutes(
+            self.credited_break_for_day_seconds(day, stats)
+        )
         counted = self._format_effective_minutes(self.daily_counted_seconds(day))
         target = self._format_effective_minutes(self._daily_target_seconds_for(day))
         remaining = self._format_effective_minutes(self.daily_remaining_seconds(day))
@@ -4861,6 +6776,8 @@ class WorkBreakApp:
             if stats.get("summary_shown"):
                 continue
             has_time = int(stats.get("work_seconds", 0)) + int(stats.get("break_seconds", 0)) > 0
+            if day == now.date() and self.current_session is not None and not self.day_suspended:
+                continue
             day_is_finished = day < now.date() or now.time() >= afternoon_end
             if has_time and day_is_finished:
                 self.show_daily_summary(day, mark_shown=True)
@@ -4871,6 +6788,8 @@ class WorkBreakApp:
         # Il tempo resta sempre accanto all'icona quando il pannello lo supporta.
         if not self.settings.enabled:
             return "OFF"
+        elif self.day_suspended:
+            base = "FINE"
         elif self.current_session is None:
             base = "Zz"
         elif self.compensating_daily_balance:
@@ -4878,7 +6797,12 @@ class WorkBreakApp:
         elif self.waiting_daily_close_choice:
             base = "Saldo?"
         elif self.in_midday_recovery:
-            base = f"↻ {format_mmss(self.midday_recovery_remaining)}"
+            recovery_time = (
+                format_negative_countdown(self.midday_recovery_overrun_seconds)
+                if self.midday_recovery_overrun_seconds > 0
+                else format_mmss(self.midday_recovery_remaining)
+            )
+            base = f"↻ {recovery_time}"
         elif self.waiting_session_end:
             base = "Fine?"
         elif self.in_overtime:
@@ -4890,7 +6814,9 @@ class WorkBreakApp:
         elif self.waiting_break_start:
             base = "STOP"
         elif self.waiting_return:
-            base = "Rientro"
+            base = f"Rientro {format_negative_countdown(self.return_overrun_seconds)}"
+        elif self.in_break and self.manual_break_indefinite:
+            base = "☕ ∞"
         elif self.in_break:
             base = f"☕ {format_mmss(self.break_remaining)}"
         elif self.in_grace:
@@ -4927,12 +6853,22 @@ class WorkBreakApp:
 
     def status_text(self) -> str:
         if not self.settings.enabled:
-            return "Promemoria in pausa"
+            return "Promemoria disattivato — timer congelato"
+        if self.day_suspended:
+            remaining = self.balance_remaining_for_day_seconds(
+                self.current_session_date or dt.date.today()
+            )
+            if remaining > 0:
+                return (
+                    "Giornata terminata anticipatamente — deficit corrente "
+                    f"{format_signed_hours_minutes(remaining)}. Puoi riprenderla più tardi."
+                )
+            return "Giornata terminata anticipatamente — puoi riprenderla più tardi"
         if self.current_session is None:
             reason = self.day_off_reason(dt.date.today())
             if reason:
                 return f"Giornata esclusa: {reason}"
-            return "Fuori fascia: timer fermo"
+            return "Fuori fascia: timer fermo — puoi iniziare manualmente"
         if self.compensating_daily_balance:
             return (
                 "Compensazione post chiusura: mancano "
@@ -4944,8 +6880,13 @@ class WorkBreakApp:
                 f"{format_signed_hours_minutes(self.compensation_remaining)}"
             )
         if self.in_midday_recovery:
+            if self.midday_recovery_overrun_seconds > 0:
+                return (
+                    "Pausa mattutina oltre il rientro da "
+                    f"{format_mmss(self.midday_recovery_overrun_seconds)}: conferma il rientro"
+                )
             if self.midday_recovery_remaining <= 0:
-                return "Pausa mattutina recuperata: conferma il rientro"
+                return "Pausa mattutina terminata: il prossimo secondo sarà conteggiato in negativo"
             return f"Recupero pausa mattutina: {format_mmss(self.midday_recovery_remaining)}"
         if self.waiting_session_end:
             remaining = max(0, SESSION_END_INACTIVITY_SECONDS - self.end_prompt_wait_seconds)
@@ -4962,7 +6903,28 @@ class WorkBreakApp:
         if self.waiting_break_start:
             return "In attesa della pausa: il lavoro continua a essere conteggiato"
         if self.waiting_return:
-            return "Pausa terminata: il ritardo non viene conteggiato come lavoro"
+            non_credited = max(
+                0,
+                int(self.break_elapsed) - int(self.break_credited_seconds),
+            )
+            if self.manual_break:
+                return (
+                    "Pausa manuale conclusa da "
+                    f"{format_negative_countdown(self.return_overrun_seconds)} — "
+                    "tempo non abbuonato "
+                    f"{format_negative_countdown(non_credited)}. Conferma quando riprendi il lavoro."
+                )
+            return (
+                "Pausa terminata da "
+                f"{format_negative_countdown(self.return_overrun_seconds)} — "
+                f"oltre i {format_mmss(self.break_credited_seconds)} abbuonati: "
+                f"{format_negative_countdown(non_credited)}. "
+                "Il ritardo non viene conteggiato come lavoro."
+            )
+        if self.in_break and self.manual_break_indefinite:
+            return "Pausa manuale senza scadenza: riprendi quando vuoi"
+        if self.in_break and self.manual_break:
+            return f"Pausa manuale: {format_mmss(self.break_remaining)}"
         if self.in_break:
             return f"Pausa: {format_mmss(self.break_remaining)}"
         if self.in_grace:
@@ -4983,10 +6945,15 @@ class WorkBreakApp:
             self.indicator_status_item.set_label(text)
         if self.indicator_toggle_item:
             self.indicator_toggle_item.set_label(
-                "Pausa promemoria" if self.settings.enabled else "Riattiva promemoria"
+                "Disattiva Promemoria" if self.settings.enabled else "Riattiva promemoria"
             )
         if self.control_window:
             self.control_window.update(text, self.settings.enabled)
+        if self.settings_window and self.settings_window.get_visible():
+            try:
+                self.settings_window.enabled.set_active(self.settings.enabled)
+            except Exception:
+                pass
 
     def quit(self) -> None:
         self._save_activity_log()

@@ -20,9 +20,45 @@ for arg in "$@"; do
   esac
 done
 
+# Ricorda se la versione installata era già in esecuzione. L'installer deve
+# sostituirla, ma non deve avviare l'app autonomamente quando prima era chiusa.
+WAS_RUNNING="0"
+RUNNING_PIDS=()
+if command -v pgrep >/dev/null 2>&1; then
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && RUNNING_PIDS+=("$pid")
+  done < <(pgrep -f "$INSTALL_DIR/workbreak_guard.py" 2>/dev/null || true)
+fi
+
+if (( ${#RUNNING_PIDS[@]} > 0 )); then
+  WAS_RUNNING="1"
+  echo "Chiudo la versione precedente di $APP_NAME…"
+  kill "${RUNNING_PIDS[@]}" 2>/dev/null || true
+  for _ in {1..50}; do
+    still_running="0"
+    for pid in "${RUNNING_PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        still_running="1"
+        break
+      fi
+    done
+    [[ "$still_running" == "0" ]] && break
+    sleep 0.1
+  done
+  for pid in "${RUNNING_PIDS[@]}"; do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+fi
+
 mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$APP_DIR" "$AUTOSTART_DIR"
-cp "$(dirname "$0")/workbreak_guard.py" "$INSTALL_DIR/workbreak_guard.py"
+SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
+cp "$SOURCE_DIR/workbreak_guard.py" "$INSTALL_DIR/workbreak_guard.py"
 chmod +x "$INSTALL_DIR/workbreak_guard.py"
+for legal_file in LICENSE AUTHORS.md NOTICE; do
+  if [[ -f "$SOURCE_DIR/$legal_file" ]]; then
+    cp "$SOURCE_DIR/$legal_file" "$INSTALL_DIR/$legal_file"
+  fi
+done
 
 cat > "$BIN_DIR/$APP_ID" <<EOF_INNER
 #!/usr/bin/env bash
@@ -113,3 +149,10 @@ fi
 echo "Comandi autostart: $APP_ID --enable-autostart | --disable-autostart | --status-autostart"
 echo "Cambio attività: Ctrl+Alt+Q oppure $APP_ID --change-activity"
 echo "Impostazioni: ~/.config/$APP_ID/settings.json o finestra Impostazioni dell'app"
+
+if [[ "$WAS_RUNNING" == "1" ]]; then
+  echo "Avvio la nuova versione perché l'istanza precedente era attiva…"
+  nohup "$BIN_DIR/$APP_ID" --autostart >/dev/null 2>&1 &
+else
+  echo "Nessuna istanza era attiva: il programma resta chiuso."
+fi
