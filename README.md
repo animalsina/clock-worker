@@ -26,6 +26,7 @@ Promemoria pause per Ubuntu/Wayland, pensato per chi lavora molte ore al PC.
   - 5 minuti;
   - 10 minuti;
   - **Inizia subito la pausa**, senza passare da “Fermati subito!”.
+- Nella scelta dell’ultimatum, nella schermata **“Fermati subito!”** e nella selezione della durata è disponibile **Salta pausa e continua il lavoro**: non registra alcuna pausa e avvia subito un nuovo blocco di lavoro sull’attività corrente.
 - Quando la pausa viene realmente avviata permette di scegliere ogni volta **5, 10 o 15 minuti**, oppure una durata personalizzata fino a 12 ore.
 - La pausa ciclica concorre all’obiettivo giornaliero entro due quote: **10 minuti per ciascun blocco iniziato di 2 ore lavorate** e un **abbuono extra giornaliero di 20 minuti**, entrambi configurabili. Con una giornata da 8 ore il valore predefinito è quindi **40 minuti regolari + 20 minuti extra**. Soltanto la parte che supera il tetto giornaliero diventa tempo da recuperare.
 - Il limite della singola pausa resta quello configurato, 10 minuti per impostazione predefinita: scegliendo 5 minuti, anche gli eventuali 5 minuti successivi trascorsi nella schermata di rientro possono essere abbuonati. Dall’undicesimo minuto la pausa produce recupero, oppure prima quando il plafond giornaliero è già esaurito.
@@ -50,9 +51,9 @@ Promemoria pause per Ubuntu/Wayland, pensato per chi lavora molte ore al PC.
 - Attribuisce ogni secondo di lavoro alla coppia **Progetto + Attività**, così è possibile passare da un lavoro all’altro senza perdere i tempi.
 - Alla fine della fascia pomeridiana mostra il riepilogo giornaliero completo, con lavoro, pause, obiettivo giornaliero, straordinario oltre fascia, EXTRA settimanale, EXTRA festivo/ferie e tempo impiegato per ogni attività.
 - La finestra **Attività e tempi** è consultabile da **Impostazioni** o dalla finestra di controllo e permette di scorrere i giorni. Mostra anche i totali settimanali e mensili e il riporto del mese precedente.
-- Da **Attività e tempi** puoi aggiungere manualmente nuove righe, modificare progetto, attività e durata, oppure eliminare una voce; i totali giornalieri vengono aggiornati automaticamente.
+- Da **Attività e tempi** puoi aggiungere manualmente nuove righe, modificare progetto, attività e durata, trasferire tutto o parte del tempo di un task verso un altro task della stessa giornata, oppure eliminare una voce. Il trasferimento non modifica il totale lavorato, il saldo o gli straordinari giornalieri.
 - Anche **Tempo precedente non classificato** è modificabile: lasciando vuota l’attività puoi correggerne soltanto la durata, compilando progetto e attività puoi classificarlo, oppure puoi eliminarlo e sottrarlo dal totale giornaliero.
-- **Mostra riepilogo** è disponibile direttamente dal menu dell’icona e dentro **Attività e tempi**. La finestra usa due tab: **Markdown**, con titolo nel formato `02 dic 2026`, testo modificabile e copia negli appunti; **Grafico**, con avanzamento dell’obiettivo, indicatori di lavoro/pausa/saldo e barre ordinate per progetto e attività.
+- **Mostra riepilogo** è disponibile direttamente dal menu dell’icona e dentro **Attività e tempi**. La finestra apre per primo **Grafico**, con avanzamento dell’obiettivo, indicatori di lavoro/pausa/saldo e barre ordinate per progetto e attività; segue **Solo testo**, con sezioni leggibili e durata sempre visibile per ogni task; infine **Markdown**, con titolo nel formato `02 dic 2026`, testo modificabile e copia negli appunti. Testo e Markdown hanno pulsanti di copia separati.
 - Conserva attività, progetti e straordinari per 24 mesi. I progetti già usati vengono proposti con ricerca rapida.
 - Il comando **Resetta e comincia adesso**, spostato nella sezione **Azioni programma** delle impostazioni, annulla pausa, ultimatum o attese e riporta subito il timer al valore completo configurato.
 - Se chiudi e riapri il programma nello stesso giorno, riprende esattamente dal punto interrotto: tempo di lavoro, ultimatum, pausa normale o manuale, pausa senza scadenza, giornata sospesa, progetto e attività corrente.
@@ -246,7 +247,7 @@ Da questa finestra puoi inoltre:
 - modificare una riga con doppio clic o con **Modifica selezionata**;
 - correggere, classificare o eliminare **Tempo precedente non classificato**;
 - eliminare una voce e sottrarre automaticamente il relativo tempo dal totale;
-- aprire il riepilogo del giorno in due tab, **Markdown** e **Grafico**; dal menu dell’icona la voce **Mostra riepilogo** apre direttamente quello della giornata corrente;
+- aprire il riepilogo del giorno nei tab ordinati **Grafico**, **Solo testo** e **Markdown**; dal menu dell’icona la voce **Mostra riepilogo** apre direttamente quello della giornata corrente;
 - aprire **Straordinari ed EXTRA del mese**, con dettaglio giornaliero, distinzione tra oltre fascia, limite settimanale e festività/ferie, totale mensile e riporto del mese precedente.
 
 Esempio di esportazione con i tempi per task disattivati, come da impostazione predefinita:

@@ -430,6 +430,13 @@ def format_mmss(seconds: int) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+def format_hhmmss(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def format_negative_countdown(seconds: int) -> str:
     """Formatta un tempo trascorso come countdown negativo, es. -05:30."""
     return f"-{format_mmss(seconds)}"
@@ -691,7 +698,12 @@ class ChoiceAlertWindow(Gtk.Window):
     ):
         super().__init__(title=title)
         self.choices = choices
-        self.window_width = 820 if len(choices) >= 4 else 620
+        if len(choices) >= 5:
+            self.window_width = 1040
+        elif len(choices) >= 4:
+            self.window_width = 820
+        else:
+            self.window_width = 620
         self.set_default_size(self.window_width, 250)
         self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
         self.set_keep_above(True)
@@ -906,9 +918,15 @@ class RegularPauseWindow(Gtk.Window):
         start_custom.connect("clicked", lambda *_: self._start(int(self.minutes.get_value())))
         custom.pack_end(start_custom, False, False, 0)
 
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        actions.set_homogeneous(True)
+        outer.pack_start(actions, False, False, 0)
+        skip = Gtk.Button(label="Salta pausa e continua il lavoro")
+        skip.connect("clicked", lambda *_: self._skip())
+        actions.pack_start(skip, True, True, 0)
         cancel = Gtk.Button(label="Annulla")
         cancel.connect("clicked", lambda *_: self._cancel())
-        outer.pack_start(cancel, False, False, 0)
+        actions.pack_start(cancel, True, True, 0)
 
         self.connect("delete-event", self._on_delete)
         self.show_all()
@@ -924,6 +942,11 @@ class RegularPauseWindow(Gtk.Window):
         self.app.regular_pause_window = None
         self.destroy()
         self.app._cancel_regular_pause_choice()
+
+    def _skip(self) -> None:
+        self.app.regular_pause_window = None
+        self.destroy()
+        self.app._skip_regular_break()
 
     def _on_delete(self, *_args) -> bool:
         self.app.regular_pause_window = None
@@ -1232,6 +1255,118 @@ class ActivityEntryDialog(Gtk.Dialog):
             + int(self.seconds_spin.get_value_as_int())
         )
         return activity, project, seconds
+
+
+class TransferTimeDialog(Gtk.Dialog):
+    def __init__(
+        self,
+        parent: Gtk.Window,
+        source: dict,
+        targets: list[dict],
+    ):
+        super().__init__(
+            title="Trasferisci tempo in un altro task",
+            transient_for=parent,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+        self.targets = targets
+        self.source_seconds = max(0, int(source.get("seconds", 0)))
+        self.add_button("Annulla", Gtk.ResponseType.CANCEL)
+        transfer_button = self.add_button("Trasferisci", Gtk.ResponseType.OK)
+        transfer_button.get_style_context().add_class("suggested-action")
+        self.set_default_response(Gtk.ResponseType.OK)
+        self.set_default_size(620, 320)
+        self.set_resizable(False)
+
+        content = self.get_content_area()
+        content.set_spacing(12)
+        content.set_border_width(16)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=12)
+        content.pack_start(grid, True, True, 0)
+
+        source_project = str(source.get("project", "")).strip()
+        source_activity = str(source.get("activity", "")).strip()
+        source_text = (
+            f"{source_project} — {source_activity}"
+            if source_project
+            else source_activity
+        )
+        source_label = Gtk.Label(label="Task di origine")
+        source_label.set_xalign(0)
+        grid.attach(source_label, 0, 0, 1, 1)
+        source_value = Gtk.Label(label=source_text)
+        source_value.set_xalign(0)
+        source_value.set_line_wrap(True)
+        grid.attach(source_value, 1, 0, 3, 1)
+
+        target_label = Gtk.Label(label="Task di destinazione")
+        target_label.set_xalign(0)
+        grid.attach(target_label, 0, 1, 1, 1)
+        self.target_combo = Gtk.ComboBoxText()
+        for index, target in enumerate(targets):
+            project = str(target.get("project", "")).strip()
+            activity = str(target.get("activity", "")).strip()
+            label = f"{project} — {activity}" if project else activity
+            self.target_combo.append(str(index), label)
+        if targets:
+            self.target_combo.set_active(0)
+        grid.attach(self.target_combo, 1, 1, 3, 1)
+
+        duration_label = Gtk.Label(label="Tempo da trasferire")
+        duration_label.set_xalign(0)
+        grid.attach(duration_label, 0, 2, 1, 1)
+
+        hours, remainder = divmod(self.source_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        self.hours_spin = Gtk.SpinButton.new_with_range(0, max(9999, hours), 1)
+        self.hours_spin.set_value(hours)
+        self.minutes_spin = Gtk.SpinButton.new_with_range(0, 59, 1)
+        self.minutes_spin.set_value(minutes)
+        self.seconds_spin = Gtk.SpinButton.new_with_range(0, 59, 1)
+        self.seconds_spin.set_value(secs)
+
+        duration_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        duration_box.pack_start(self.hours_spin, False, False, 0)
+        duration_box.pack_start(Gtk.Label(label="ore"), False, False, 0)
+        duration_box.pack_start(self.minutes_spin, False, False, 0)
+        duration_box.pack_start(Gtk.Label(label="min"), False, False, 0)
+        duration_box.pack_start(self.seconds_spin, False, False, 0)
+        duration_box.pack_start(Gtk.Label(label="sec"), False, False, 0)
+        grid.attach(duration_box, 1, 2, 3, 1)
+
+        available = Gtk.Label(
+            label=f"Tempo disponibile nel task: {format_hhmmss(self.source_seconds)}"
+        )
+        available.set_xalign(0)
+        grid.attach(available, 1, 3, 3, 1)
+
+        note = Gtk.Label(
+            label=(
+                "Il trasferimento modifica soltanto la distribuzione del tempo tra i task: "
+                "il totale di lavoro, il saldo e gli straordinari della giornata non cambiano."
+            )
+        )
+        note.set_xalign(0)
+        note.set_line_wrap(True)
+        grid.attach(note, 0, 4, 4, 1)
+
+        self.show_all()
+
+    def values(self) -> Optional[tuple[dict, int]]:
+        target_id = self.target_combo.get_active_id()
+        if target_id is None:
+            return None
+        try:
+            target = self.targets[int(target_id)]
+        except (ValueError, IndexError):
+            return None
+        seconds = (
+            int(self.hours_spin.get_value_as_int()) * 3600
+            + int(self.minutes_spin.get_value_as_int()) * 60
+            + int(self.seconds_spin.get_value_as_int())
+        )
+        return target, seconds
 
 
 class MarkdownPreviewWindow(Gtk.Window):
@@ -1561,7 +1696,7 @@ class DayChartView(Gtk.ScrolledWindow):
 
 
 class DaySummaryWindow(Gtk.Window):
-    """Riepilogo giornaliero con tab Markdown e tab grafico."""
+    """Riepilogo giornaliero con grafico, testo leggibile e Markdown."""
 
     def __init__(
         self,
@@ -1594,30 +1729,60 @@ class DaySummaryWindow(Gtk.Window):
         self.notebook.set_scrollable(True)
         outer.pack_start(self.notebook, True, True, 0)
 
-        markdown_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.text_view = Gtk.TextView()
-        self.text_view.set_editable(True)
-        self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.text_view.set_monospace(True)
-        self.text_view.get_buffer().set_text(app.build_day_markdown(day))
-        markdown_scroll = Gtk.ScrolledWindow()
-        markdown_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        markdown_scroll.add(self.text_view)
-        markdown_box.pack_start(markdown_scroll, True, True, 0)
-        self.notebook.append_page(markdown_box, Gtk.Label(label="Markdown"))
-
         self.chart_view = DayChartView(app, day)
         self.notebook.append_page(self.chart_view, Gtk.Label(label="Grafico"))
+
+        plain_text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.plain_text_view = Gtk.TextView()
+        self.plain_text_view.set_editable(False)
+        self.plain_text_view.set_cursor_visible(False)
+        self.plain_text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.plain_text_view.get_buffer().set_text(app.build_day_plain_text(day))
+        plain_text_scroll = Gtk.ScrolledWindow()
+        plain_text_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        plain_text_scroll.add(self.plain_text_view)
+        plain_text_box.pack_start(plain_text_scroll, True, True, 0)
+        self.notebook.append_page(plain_text_box, Gtk.Label(label="Solo testo"))
+
+        markdown_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.markdown_view = Gtk.TextView()
+        self.markdown_view.set_editable(True)
+        self.markdown_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.markdown_view.set_monospace(True)
+        self.markdown_view.get_buffer().set_text(app.build_day_markdown(day))
+        markdown_scroll = Gtk.ScrolledWindow()
+        markdown_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        markdown_scroll.add(self.markdown_view)
+        markdown_box.pack_start(markdown_scroll, True, True, 0)
+        self.notebook.append_page(markdown_box, Gtk.Label(label="Markdown"))
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         outer.pack_start(footer, False, False, 0)
 
-        copy_button = Gtk.Button(label="Copia Markdown")
-        copy_button.connect("clicked", self._copy_markdown)
-        footer.pack_start(copy_button, False, False, 0)
+        copy_text_button = Gtk.Button(label="Copia testo")
+        copy_text_button.connect(
+            "clicked",
+            lambda button: self._copy_view_text(
+                self.plain_text_view,
+                button,
+                "Copia testo",
+            ),
+        )
+        footer.pack_start(copy_text_button, False, False, 0)
 
-        refresh_button = Gtk.Button(label="Aggiorna grafico")
-        refresh_button.connect("clicked", lambda *_: self.chart_view.refresh())
+        copy_markdown_button = Gtk.Button(label="Copia Markdown")
+        copy_markdown_button.connect(
+            "clicked",
+            lambda button: self._copy_view_text(
+                self.markdown_view,
+                button,
+                "Copia Markdown",
+            ),
+        )
+        footer.pack_start(copy_markdown_button, False, False, 0)
+
+        refresh_button = Gtk.Button(label="Aggiorna riepilogo")
+        refresh_button.connect("clicked", lambda *_: self._refresh_summary())
         footer.pack_start(refresh_button, False, False, 0)
 
         close_button = Gtk.Button(label="Chiudi")
@@ -1634,20 +1799,37 @@ class DaySummaryWindow(Gtk.Window):
         place_on_active_monitor(self, width, height)
         self.present()
 
-    def _copy_markdown(self, button: Gtk.Button) -> None:
-        buffer = self.text_view.get_buffer()
+    def _refresh_summary(self) -> None:
+        self.chart_view.refresh()
+        self.plain_text_view.get_buffer().set_text(
+            self.app.build_day_plain_text(self.day)
+        )
+        self.markdown_view.get_buffer().set_text(
+            self.app.build_day_markdown(self.day)
+        )
+
+    @staticmethod
+    def _copy_view_text(
+        text_view: Gtk.TextView,
+        button: Gtk.Button,
+        original_label: str,
+    ) -> None:
+        buffer = text_view.get_buffer()
         start, end = buffer.get_bounds()
         current_text = buffer.get_text(start, end, True)
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
         clipboard.set_text(current_text, -1)
         clipboard.store()
         button.set_label("Copiato")
-        GLib.timeout_add_seconds(2, lambda: self._restore_copy_label(button))
+        GLib.timeout_add_seconds(
+            2,
+            lambda: DaySummaryWindow._restore_copy_label(button, original_label),
+        )
 
     @staticmethod
-    def _restore_copy_label(button: Gtk.Button) -> bool:
+    def _restore_copy_label(button: Gtk.Button, original_label: str) -> bool:
         if button.get_parent() is not None:
-            button.set_label("Copia Markdown")
+            button.set_label(original_label)
         return False
 
 
@@ -1658,7 +1840,7 @@ class ActivitySummaryWindow(Gtk.Window):
         self.selected_day = selected_day or dt.date.today()
         self._changing_day = False
         self.markdown_window: Optional[Gtk.Window] = None
-        self.set_default_size(940, 580)
+        self.set_default_size(1180, 600)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_border_width(16)
         self.connect("destroy", self._on_destroy)
@@ -1722,6 +1904,13 @@ class ActivitySummaryWindow(Gtk.Window):
         edit_button.connect("clicked", lambda *_: self._edit_selected())
         actions.pack_start(edit_button, False, False, 0)
 
+        transfer_button = Gtk.Button(label="Trasferisci tempo in un altro task")
+        transfer_button.connect("clicked", lambda *_: self._transfer_selected())
+        transfer_button.set_tooltip_text(
+            "Sposta tutto o parte del tempo del task selezionato verso un altro task della stessa giornata"
+        )
+        actions.pack_start(transfer_button, False, False, 0)
+
         delete_button = Gtk.Button(label="Elimina selezionata")
         delete_button.connect("clicked", lambda *_: self._delete_selected())
         actions.pack_start(delete_button, False, False, 0)
@@ -1745,7 +1934,7 @@ class ActivitySummaryWindow(Gtk.Window):
 
         self.refresh()
         self.show_all()
-        place_on_active_monitor(self, 940, 580)
+        place_on_active_monitor(self, 1180, 600)
         self.present()
 
     def _on_destroy(self, *_args) -> None:
@@ -1897,6 +2086,82 @@ class ActivitySummaryWindow(Gtk.Window):
 
         if not changed:
             self._message("Voce non trovata", "La voce è cambiata nel frattempo. Aggiorna la finestra e riprova.")
+        self.refresh()
+
+    def _transfer_selected(self) -> None:
+        row = self._selected_row()
+        if row is None:
+            self._message("Nessuna selezione", "Seleziona prima il task da cui trasferire il tempo.")
+            return
+        if row["unclassified"]:
+            self._message(
+                "Tempo non classificato",
+                "Prima assegna il tempo non classificato a un task, poi potrai trasferirlo.",
+                Gtk.MessageType.WARNING,
+            )
+            return
+        if row["seconds"] <= 0:
+            self._message("Nessun tempo disponibile", "Il task selezionato non contiene tempo da trasferire.")
+            return
+
+        targets = []
+        for item in self.app._activity_totals_for(self.selected_day):
+            activity = str(item.get("text", "")).strip()
+            project = str(item.get("project", "")).strip()
+            if not activity or self.app._same_activity(item, row["activity"], row["project"]):
+                continue
+            targets.append(
+                {
+                    "activity": activity,
+                    "project": project,
+                    "seconds": max(0, int(item.get("work_seconds", 0))),
+                }
+            )
+
+        if not targets:
+            self._message(
+                "Nessun task di destinazione",
+                "Nella giornata deve esistere almeno un altro task a cui trasferire il tempo.",
+                Gtk.MessageType.WARNING,
+            )
+            return
+
+        dialog = TransferTimeDialog(self, row, targets)
+        response = dialog.run()
+        values = dialog.values() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        if values is None:
+            return
+        target, seconds = values
+        if seconds <= 0:
+            self._message(
+                "Durata non valida",
+                "Indica almeno un secondo da trasferire.",
+                Gtk.MessageType.WARNING,
+            )
+            return
+        if seconds > row["seconds"]:
+            self._message(
+                "Tempo insufficiente",
+                "Non puoi trasferire più tempo di quello presente nel task di origine.",
+                Gtk.MessageType.WARNING,
+            )
+            return
+
+        changed = self.app.transfer_activity_time(
+            self.selected_day,
+            row["activity"],
+            row["project"],
+            str(target.get("activity", "")),
+            str(target.get("project", "")),
+            seconds,
+        )
+        if not changed:
+            self._message(
+                "Trasferimento non riuscito",
+                "I task sono cambiati nel frattempo. Aggiorna la finestra e riprova.",
+                Gtk.MessageType.WARNING,
+            )
         self.refresh()
 
     def _delete_selected(self) -> None:
@@ -5110,6 +5375,7 @@ class WorkBreakApp:
                 ("5 minuti", lambda: self._start_grace(5 * 60)),
                 ("10 minuti", lambda: self._start_grace(10 * 60)),
                 ("Inizia subito la pausa…", self._start_break_immediately),
+                ("Salta pausa e continua il lavoro", self._skip_regular_break),
             ],
         )
         self._save_runtime_state(force=True)
@@ -5155,11 +5421,13 @@ class WorkBreakApp:
             except Exception:
                 pass
         prefix = "Pausa avviata manualmente." if immediate else "Il tempo scelto è terminato."
-        self.stop_window = AlertWindow(
+        self.stop_window = ChoiceAlertWindow(
             "Fermati subito!",
             f"{prefix}\nIl lavoro continua finché non scegli la durata e avvii realmente la pausa.",
-            "Scegli durata pausa",
-            lambda: self._request_regular_pause_duration("stop"),
+            [
+                ("Scegli durata pausa", lambda: self._request_regular_pause_duration("stop")),
+                ("Salta pausa e continua il lavoro", self._skip_regular_break),
+            ],
         )
         self._save_runtime_state(force=True)
 
@@ -5186,6 +5454,30 @@ class WorkBreakApp:
         self._save_runtime_state(force=True)
         self._update_ui()
         return False
+
+    def _skip_regular_break(self) -> None:
+        """Ignora la pausa ciclica e avvia subito un nuovo blocco di lavoro."""
+        for attr in ("grace_choice_window", "stop_window", "regular_pause_window"):
+            window = getattr(self, attr, None)
+            try:
+                if window:
+                    window.destroy()
+            except Exception:
+                pass
+            setattr(self, attr, None)
+
+        self.waiting_grace_choice = False
+        self.waiting_break_start = False
+        self.in_grace = False
+        self.grace_remaining = 0
+        self.regular_pause_origin = "stop"
+        self.resume_preserves_cycle = False
+        self.work_remaining = self._work_cycle_seconds_for_now(
+            dt.datetime.now(), self.current_session
+        )
+        self.clock.hide()
+        self._save_runtime_state(force=True)
+        self._update_ui()
 
     def start_break(self) -> None:
         """Compatibilità: apre la scelta della durata della pausa ciclica."""
@@ -5524,6 +5816,7 @@ class WorkBreakApp:
             stats.setdefault("special_workday_label", "")
             stats.setdefault("activities", [])
             stats.setdefault("activity_totals", [])
+            stats.setdefault("time_transfers", [])
             stats.setdefault("summary_shown", False)
             stats.setdefault("day_closed", False)
             stats.setdefault("close_choice", "")
@@ -5532,6 +5825,8 @@ class WorkBreakApp:
                 stats["activities"] = []
             if not isinstance(stats["activity_totals"], list):
                 stats["activity_totals"] = []
+            if not isinstance(stats["time_transfers"], list):
+                stats["time_transfers"] = []
             for entry in stats["activities"]:
                 if isinstance(entry, dict):
                     entry.setdefault("project", "")
@@ -5603,6 +5898,7 @@ class WorkBreakApp:
                 "special_workday_label": "",
                 "activities": [],
                 "activity_totals": [],
+                "time_transfers": [],
                 "summary_shown": False,
                 "day_closed": False,
                 "close_choice": "",
@@ -5621,6 +5917,7 @@ class WorkBreakApp:
         stats.setdefault("special_workday_label", "")
         stats.setdefault("activities", [])
         stats.setdefault("activity_totals", [])
+        stats.setdefault("time_transfers", [])
         stats.setdefault("summary_shown", False)
         stats.setdefault("day_closed", False)
         stats.setdefault("close_choice", "")
@@ -6364,6 +6661,86 @@ class WorkBreakApp:
             self._save_runtime_state(force=True)
         return True
 
+    def transfer_activity_time(
+        self,
+        day: dt.date,
+        source_activity: str,
+        source_project: str,
+        target_activity: str,
+        target_project: str,
+        seconds: int,
+    ) -> bool:
+        source_activity = source_activity.strip()
+        source_project = source_project.strip()
+        target_activity = target_activity.strip()
+        target_project = target_project.strip()
+        seconds = max(0, int(seconds))
+        if (
+            not source_activity
+            or not target_activity
+            or seconds <= 0
+            or (
+                source_activity.casefold() == target_activity.casefold()
+                and source_project.casefold() == target_project.casefold()
+            )
+        ):
+            return False
+
+        stats = self._stats_for(day)
+        totals = stats.setdefault("activity_totals", [])
+        source_index = next(
+            (
+                index
+                for index, item in enumerate(totals)
+                if isinstance(item, dict)
+                and self._same_activity(item, source_activity, source_project)
+            ),
+            None,
+        )
+        target = next(
+            (
+                item
+                for item in totals
+                if isinstance(item, dict)
+                and self._same_activity(item, target_activity, target_project)
+            ),
+            None,
+        )
+        if source_index is None or target is None:
+            return False
+
+        source = totals[source_index]
+        available = max(0, int(source.get("work_seconds", 0)))
+        if seconds > available:
+            return False
+
+        event_time = self._manual_event_time(day)
+        source["work_seconds"] = available - seconds
+        target["work_seconds"] = max(0, int(target.get("work_seconds", 0))) + seconds
+        target["last_used"] = event_time
+        if int(source.get("work_seconds", 0)) <= 0:
+            totals.pop(source_index)
+
+        stats.setdefault("time_transfers", []).append(
+            {
+                "time": event_time,
+                "seconds": seconds,
+                "source": {
+                    "text": source_activity,
+                    "project": source_project,
+                },
+                "target": {
+                    "text": target_activity,
+                    "project": target_project,
+                },
+            }
+        )
+        stats["time_transfers"] = stats["time_transfers"][-500:]
+        stats["summary_shown"] = False
+        self._remember_project(target_project)
+        self._save_activity_log()
+        return True
+
     def delete_manual_activity(self, day: dt.date, activity: str, project: str) -> bool:
         activity = activity.strip()
         project = project.strip()
@@ -6426,6 +6803,197 @@ class WorkBreakApp:
         for char in ("*", "_", "[", "]", "`"):
             escaped = escaped.replace(char, f"\\{char}")
         return escaped
+
+    def build_day_plain_text(self, day: dt.date) -> str:
+        """Genera un riepilogo leggibile senza sintassi Markdown."""
+        stats = self.activity_log.get("days", {}).get(
+            day.isoformat(),
+            {
+                "work_seconds": 0,
+                "break_seconds": 0,
+                "credited_break_seconds": 0,
+                "overtime_seconds": 0,
+                "activity_totals": [],
+            },
+        )
+        rows = self._activity_totals_for(day, include_unclassified=True)
+        lines = [
+            "RIEPILOGO GIORNALIERO",
+            format_italian_markdown_date(day),
+            "",
+            "ATTIVITÀ SVOLTE",
+        ]
+
+        if rows:
+            grouped: dict[str, list[dict]] = {}
+            for item in rows:
+                project = str(item.get("project", "")).strip() or "Senza progetto"
+                grouped.setdefault(project, []).append(item)
+            for project, items in grouped.items():
+                lines.append(project)
+                for item in items:
+                    activity = (
+                        str(item.get("text", "")).strip()
+                        or "Tempo non classificato"
+                    )
+                    duration = self._format_effective_minutes(
+                        int(item.get("work_seconds", 0))
+                    )
+                    lines.append(f"  • {activity}: {duration}")
+                lines.append("")
+            if lines[-1] == "":
+                lines.pop()
+        else:
+            lines.append("Nessuna attività registrata.")
+
+        work_seconds = max(0, int(stats.get("work_seconds", 0)))
+        break_seconds = max(0, int(stats.get("break_seconds", 0)))
+        credited_break_seconds = max(
+            0, int(self.credited_break_for_day_seconds(day, stats))
+        )
+        recoverable_break_seconds = max(
+            0, break_seconds - credited_break_seconds
+        )
+        counted_seconds = max(0, int(self.daily_counted_seconds(day)))
+        target_seconds = max(0, int(self._daily_target_seconds_for(day)))
+        remaining_seconds = max(0, int(self.daily_remaining_seconds(day)))
+        balance_before_seconds = int(self.time_balance_before_day_seconds(day))
+        if bool(stats.get("day_closed", False)):
+            balance_after_seconds = int(self.active_time_balance_seconds(day))
+        else:
+            balance_after_seconds = int(
+                self.projected_time_balance_for_day_seconds(day)
+            )
+
+        lines.extend(
+            [
+                "",
+                "TEMPI DELLA GIORNATA",
+                f"Lavoro effettivo: {self._format_effective_minutes(work_seconds)}",
+                f"Pause totali: {self._format_effective_minutes(break_seconds)}",
+                (
+                    "Pausa conteggiata nell’obiettivo: "
+                    f"{self._format_effective_minutes(credited_break_seconds)}"
+                ),
+                (
+                    "Pausa da recuperare: "
+                    f"{self._format_effective_minutes(recoverable_break_seconds)}"
+                ),
+            ]
+        )
+
+        if self._is_special_workday(day, stats):
+            lines.extend(
+                [
+                    "",
+                    "GIORNATA EXTRA",
+                    f"Motivo: {self._special_workday_label(day, stats)}",
+                    (
+                        "EXTRA festivo/ferie: "
+                        f"{self._format_effective_minutes(self.special_day_extra_seconds(day))}"
+                    ),
+                ]
+            )
+        elif self.day_has_regular_target(day):
+            lines.extend(
+                [
+                    "",
+                    "OBIETTIVO E SALDO",
+                    (
+                        "Avanzamento: "
+                        f"{self._format_effective_minutes(counted_seconds)} su "
+                        f"{self._format_effective_minutes(target_seconds)}"
+                    ),
+                    (
+                        "Tempo ancora da fare: "
+                        f"{self._format_effective_minutes(remaining_seconds)}"
+                    ),
+                    (
+                        "Saldo iniziale: "
+                        f"{format_signed_hours_minutes(balance_before_seconds)}"
+                    ),
+                    (
+                        "Saldo dopo la giornata: "
+                        f"{format_signed_hours_minutes(balance_after_seconds)}"
+                    ),
+                    (
+                        "Scelta di chiusura: "
+                        f"{str(stats.get('close_choice', '')).strip() or 'non ancora effettuata'}"
+                    ),
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "OBIETTIVO E SALDO",
+                    "Obiettivo giornaliero: non previsto",
+                ]
+            )
+
+        current_month_label = f"{ITALIAN_MONTH_NAMES[day.month - 1]} {day.year}"
+        previous_year, previous_month = self.previous_month(day.year, day.month)
+        previous_month_label = (
+            f"{ITALIAN_MONTH_NAMES[previous_month - 1]} {previous_year}"
+        )
+        closure_date = self._extra_closure_date(day.year, day.month)
+        lines.extend(
+            [
+                "",
+                "STRAORDINARI ED EXTRA",
+                (
+                    "Straordinario oltre fascia del giorno: "
+                    f"{self._format_effective_minutes(int(stats.get('overtime_seconds', 0)))}"
+                ),
+                (
+                    "Settimana ordinaria: "
+                    f"{self._format_effective_minutes(self.regular_week_counted_seconds(day))} su "
+                    f"{self._format_effective_minutes(self._weekly_target_seconds_for(day))}"
+                ),
+                (
+                    "EXTRA oltre limite settimanale: "
+                    f"{self._format_effective_minutes(self.weekly_extra_seconds(day))}"
+                ),
+                (
+                    "EXTRA settimanale attribuito al giorno: "
+                    f"{self._format_effective_minutes(self.weekly_extra_for_day_seconds(day))}"
+                ),
+                (
+                    "EXTRA totale del giorno: "
+                    f"{self._format_effective_minutes(self.total_extra_for_day_seconds(day))}"
+                ),
+                (
+                    f"EXTRA {current_month_label}: "
+                    f"{self._format_effective_minutes(self.month_extra_seconds(day.year, day.month))}"
+                ),
+                (
+                    "Di cui EXTRA festivi/ferie: "
+                    f"{self._format_effective_minutes(self.month_special_extra_seconds(day.year, day.month))}"
+                ),
+                (
+                    f"Straordinario oltre fascia {current_month_label}: "
+                    f"{self._format_effective_minutes(self.month_overtime_seconds(day.year, day.month))}"
+                ),
+                (
+                    f"EXTRA riportato da {previous_month_label}: "
+                    f"{self._format_effective_minutes(self.month_extra_seconds(previous_year, previous_month))}"
+                ),
+                (
+                    f"Straordinario riportato da {previous_month_label}: "
+                    f"{self._format_effective_minutes(self.month_overtime_seconds(previous_year, previous_month))}"
+                ),
+                (
+                    "Saldo ore attivo: "
+                    f"{format_signed_hours_minutes(self.active_time_balance_seconds())}"
+                ),
+                (
+                    "EXTRA da saldo chiuso nel mese: "
+                    f"{self._format_effective_minutes(self.closed_balance_extra_seconds(day.year, day.month))}"
+                ),
+                f"Data di chiusura saldo del mese: {closure_date.strftime('%d/%m/%Y')}",
+            ]
+        )
+        return "\n".join(lines)
 
     def build_day_markdown(self, day: dt.date) -> str:
         stats = self.activity_log.get("days", {}).get(
