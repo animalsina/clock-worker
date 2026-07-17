@@ -115,7 +115,60 @@ Puoi modificare:
 - suono alla scadenza dei timer: nessuno, beep morbido, doppio beep o campanello, con anteprima tramite **Prova**;
 - volume beep;
 - numero beep e distanza in secondi;
-- inclusione facoltativa del tempo impiegato accanto a ogni task nel riepilogo Markdown, disattivata per impostazione predefinita.
+- inclusione facoltativa del tempo impiegato accanto a ogni task nel riepilogo Markdown, disattivata per impostazione predefinita;
+- backup JSON locale indipendente da Google, attivo per impostazione predefinita;
+- seconda copia opzionale su Google Drive o in una cartella locale già sincronizzata con Drive;
+- backup manuale unico verso tutte le destinazioni configurate;
+- backup automatico giornaliero all’orario di apertura mattutina oppure mensile alla prima apertura utile;
+- ripristino da un backup locale o remoto con conferma e creazione preventiva di una copia locale di sicurezza.
+
+### Backup locale e Google Drive
+
+Nelle impostazioni, la sezione **Backup dati locale e Google Drive** gestisce due destinazioni indipendenti:
+
+1. **copia locale**, disponibile senza login e attiva per impostazione predefinita;
+2. **seconda copia Google Drive**, facoltativa.
+
+La cartella locale predefinita è:
+
+```text
+~/.config/workbreak-guard/backups/
+```
+
+Puoi cambiarla con **Scegli cartella locale** oppure disattivare la copia locale. Il pulsante **Esegui backup adesso** crea un solo file JSON e prova a copiarlo in tutte le destinazioni abilitate. Se Google Drive fallisce, la copia locale rimane valida e il programma mostra separatamente l’errore remoto.
+
+Per configurare Google Drive:
+
+1. premi **Configura backup su Google Drive**;
+2. nel selettore apri **Altre posizioni** e scegli il Google Drive già collegato;
+3. non è necessario aggiungere nuovamente un account esistente;
+4. in alternativa puoi scegliere una normale cartella locale già sincronizzata con Drive, per esempio tramite un mount esterno;
+5. il programma crea subito una copia di verifica e mostra **Tutto ok, configurato** oppure il problema rilevato.
+
+**Gestisci account Google** apre Account online di GNOME solo quando vuoi realmente aggiungere, rimuovere o correggere un account. Non viene più aperto automaticamente dal flusso di configurazione, evitando il tentativo di duplicare un account già presente.
+
+I backup sono file autonomi con nome simile a:
+
+```text
+workbreak-guard-backup-2026-07-17_183000.json
+```
+
+Ogni file contiene in forma leggibile:
+
+- `settings.json`;
+- `activity-log.json`;
+- `runtime-state.json`, quando presente;
+- data, tipo e versione del formato di backup.
+
+La frequenza condivisa può essere **Disattivata**, **Ogni giorno all’apertura mattutina** oppure **Ogni mese alla prima apertura**. Per il giornaliero viene usato l’orario **Mattina inizio**; se il programma viene aperto più tardi, il backup parte alla prima apertura utile della giornata. Ogni destinazione conserva il proprio stato: se la copia locale riesce e Drive fallisce, al successivo avvio Drive può essere ritentato senza rigenerare inutilmente la copia locale già completata.
+
+**Ripristina da backup** apre un selettore che permette di scegliere sia un JSON locale sia un file raggiungibile tramite Google Drive. Prima di sostituire i dati, l’app crea automaticamente una copia locale in:
+
+```text
+~/.config/workbreak-guard/restore-safety/
+```
+
+Dopo il ripristino il timer viene congelato per impedire che lo stato appena recuperato venga sovrascritto. Puoi scegliere **Riavvia ora** oppure riaprire manualmente WorkBreak Guard in seguito.
 
 Con i valori predefiniti, una giornata da 8 ore funziona così:
 

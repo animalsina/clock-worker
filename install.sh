@@ -135,8 +135,10 @@ else
 fi
 
 if command -v apt-get >/dev/null 2>&1; then
-  echo "Dipendenze consigliate su Ubuntu:"
+  echo "Dipendenze principali consigliate su Ubuntu:"
   echo "  sudo apt-get install -y python3-gi gir1.2-gtk-3.0 pulseaudio-utils gir1.2-ayatanaappindicator3-0.1 gnome-shell-extension-appindicator"
+  echo "Integrazione Google Drive opzionale tramite GNOME:"
+  echo "  sudo apt-get install -y gnome-online-accounts gvfs-backends"
 fi
 
 echo "Installato: $APP_NAME"

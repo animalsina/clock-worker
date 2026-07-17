@@ -30,6 +30,7 @@ Funzioni principali:
 - Calcola festività nazionali, patroni di Este/Firenze e ferie o ricorrenze personalizzate.
 - Impostazioni GTK salvate in ~/.config/workbreak-guard/settings.json.
 - Statistiche salvate in ~/.config/workbreak-guard/activity-log.json.
+- Backup e ripristino JSON locale con seconda copia opzionale su Google Drive.
 - AppIndicator/Ayatana tray se disponibile, con etichetta tempo compatta se supportata.
 - Finestra controllo fallback se la tray non è disponibile.
 """
@@ -47,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import wave
+import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -54,7 +56,7 @@ from typing import Callable, Optional
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib, Gdk, Pango  # type: ignore
+from gi.repository import Gtk, GLib, Gdk, Pango, Gio  # type: ignore
 
 # AppIndicator è opzionale. Su Ubuntu/GNOME spesso serve l'estensione AppIndicator.
 Indicator = None
@@ -82,6 +84,8 @@ CONFIG_DIR = Path.home() / ".config" / APP_ID
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 ACTIVITY_LOG_FILE = CONFIG_DIR / "activity-log.json"
 RUNTIME_STATE_FILE = CONFIG_DIR / "runtime-state.json"
+RESTORE_SAFETY_DIR = CONFIG_DIR / "restore-safety"
+DEFAULT_LOCAL_BACKUP_DIR = CONFIG_DIR / "backups"
 PID_FILE = CONFIG_DIR / "app.pid"
 AUTOSTART_DIR = Path.home() / ".config" / "autostart"
 AUTOSTART_FILE = AUTOSTART_DIR / f"{APP_ID}.desktop"
@@ -129,6 +133,19 @@ class Settings:
     clock_opacity_low: float = 0.22
     clock_opacity_high: float = 0.72
     launch_minimized: bool = True
+    local_backup_enabled: bool = True
+    local_backup_folder: str = field(
+        default_factory=lambda: str(DEFAULT_LOCAL_BACKUP_DIR)
+    )
+    local_backup_last_success_at: str = ""
+    local_backup_last_error: str = ""
+    local_backup_last_auto_key: str = ""
+    google_drive_backup_frequency: str = "off"
+    google_drive_backup_folder_uri: str = ""
+    google_drive_backup_folder_name: str = ""
+    google_drive_backup_last_success_at: str = ""
+    google_drive_backup_last_error: str = ""
+    google_drive_backup_last_auto_key: str = ""
 
     @classmethod
     def load(cls) -> "Settings":
@@ -176,6 +193,41 @@ class Settings:
         self.beep_count = clamp_int(self.beep_count, 0, 20)
         self.beep_interval_seconds = clamp_int(self.beep_interval_seconds, 5, 300)
         self.beep_volume = max(0.0, min(float(self.beep_volume), 0.30))
+        self.local_backup_enabled = bool(self.local_backup_enabled)
+        self.local_backup_folder = os.path.expandvars(
+            os.path.expanduser(str(self.local_backup_folder or DEFAULT_LOCAL_BACKUP_DIR))
+        ).strip()
+        if not self.local_backup_folder:
+            self.local_backup_folder = str(DEFAULT_LOCAL_BACKUP_DIR)
+        self.local_backup_last_success_at = str(
+            self.local_backup_last_success_at or ""
+        ).strip()
+        self.local_backup_last_error = str(
+            self.local_backup_last_error or ""
+        ).strip()
+        self.local_backup_last_auto_key = str(
+            self.local_backup_last_auto_key or ""
+        ).strip()
+        self.google_drive_backup_frequency = str(
+            self.google_drive_backup_frequency or "off"
+        ).strip().lower()
+        if self.google_drive_backup_frequency not in {"off", "daily", "monthly"}:
+            self.google_drive_backup_frequency = "off"
+        self.google_drive_backup_folder_uri = str(
+            self.google_drive_backup_folder_uri or ""
+        ).strip()
+        self.google_drive_backup_folder_name = str(
+            self.google_drive_backup_folder_name or ""
+        ).strip()
+        self.google_drive_backup_last_success_at = str(
+            self.google_drive_backup_last_success_at or ""
+        ).strip()
+        self.google_drive_backup_last_error = str(
+            self.google_drive_backup_last_error or ""
+        ).strip()
+        self.google_drive_backup_last_auto_key = str(
+            self.google_drive_backup_last_auto_key or ""
+        ).strip()
         self.active_days = [int(x) for x in self.active_days if int(x) in range(7)] or [0, 1, 2, 3, 4]
         self.morning_start = normalize_time(self.morning_start, "09:00")
         self.morning_end = normalize_time(self.morning_end, "13:00")
@@ -2974,6 +3026,145 @@ class SettingsWindow(Gtk.Window):
         show_control.connect("clicked", lambda *_: app.show_control())
         actions_grid.attach(show_control, 1, 1, 1, 1)
 
+        backup_frame = Gtk.Frame(label="Backup dati locale e Google Drive")
+        backup_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        backup_box.set_border_width(10)
+        backup_frame.add(backup_box)
+        content.pack_start(backup_frame, False, False, 0)
+
+        backup_intro = Gtk.Label(
+            label=(
+                "Il backup locale funziona senza account Google. Se configuri anche "
+                "Google Drive, lo stesso JSON viene salvato in entrambe le destinazioni."
+            )
+        )
+        backup_intro.set_xalign(0)
+        backup_intro.set_line_wrap(True)
+        backup_box.pack_start(backup_intro, False, False, 0)
+
+        self.local_backup_enabled = Gtk.CheckButton(
+            label="Crea sempre anche una copia locale"
+        )
+        self.local_backup_enabled.set_active(
+            self.edit_settings.local_backup_enabled
+        )
+        self.local_backup_enabled.connect(
+            "toggled", self._local_backup_enabled_changed
+        )
+        backup_box.pack_start(self.local_backup_enabled, False, False, 0)
+
+        self.local_backup_status = Gtk.Label(label="")
+        self.local_backup_status.set_xalign(0)
+        self.local_backup_status.set_line_wrap(True)
+        self.local_backup_status.set_selectable(True)
+        backup_box.pack_start(self.local_backup_status, False, False, 0)
+
+        local_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.local_backup_choose = Gtk.Button(label="Scegli cartella locale")
+        self.local_backup_choose.connect(
+            "clicked", lambda *_: self.app.configure_local_backup_folder(self)
+        )
+        local_buttons.pack_start(self.local_backup_choose, False, False, 0)
+        backup_box.pack_start(local_buttons, False, False, 0)
+
+        backup_schedule = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        schedule_label = Gtk.Label(label="Frequenza automatica")
+        schedule_label.set_xalign(0)
+        backup_schedule.pack_start(schedule_label, False, False, 0)
+        self.backup_frequency = Gtk.ComboBoxText()
+        self.backup_frequency.append("off", "Disattivata")
+        self.backup_frequency.append(
+            "daily", "Ogni giorno all'apertura mattutina"
+        )
+        self.backup_frequency.append(
+            "monthly", "Ogni mese alla prima apertura"
+        )
+        self.backup_frequency.set_active_id(
+            self.edit_settings.google_drive_backup_frequency
+        )
+        self.backup_frequency.connect(
+            "changed", self._backup_frequency_changed
+        )
+        backup_schedule.pack_start(self.backup_frequency, True, True, 0)
+        backup_box.pack_start(backup_schedule, False, False, 0)
+
+        self.backup_schedule_info = Gtk.Label(label="")
+        self.backup_schedule_info.set_xalign(0)
+        self.backup_schedule_info.set_line_wrap(True)
+        backup_box.pack_start(self.backup_schedule_info, False, False, 0)
+
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        backup_box.pack_start(separator, False, False, 2)
+
+        google_title = Gtk.Label(label="Seconda copia opzionale su Google Drive")
+        google_title.set_xalign(0)
+        google_title.modify_font(Pango.FontDescription("Sans Bold 10"))
+        backup_box.pack_start(google_title, False, False, 0)
+
+        google_help = Gtk.Label(
+            label=(
+                "Premi Configura e scegli Google Drive da Altre posizioni. "
+                "Se l'account esiste già non devi aggiungerlo di nuovo. È accettata "
+                "anche una cartella locale già sincronizzata con Drive."
+            )
+        )
+        google_help.set_xalign(0)
+        google_help.set_line_wrap(True)
+        backup_box.pack_start(google_help, False, False, 0)
+
+        self.google_backup_status = Gtk.Label(label="")
+        self.google_backup_status.set_xalign(0)
+        self.google_backup_status.set_line_wrap(True)
+        backup_box.pack_start(self.google_backup_status, False, False, 0)
+
+        self.google_backup_folder = Gtk.Label(label="")
+        self.google_backup_folder.set_xalign(0)
+        self.google_backup_folder.set_line_wrap(True)
+        self.google_backup_folder.set_selectable(True)
+        backup_box.pack_start(self.google_backup_folder, False, False, 0)
+
+        google_buttons = Gtk.Grid(column_spacing=8, row_spacing=8)
+        google_buttons.set_column_homogeneous(True)
+        backup_box.pack_start(google_buttons, False, False, 0)
+
+        self.google_backup_configure = Gtk.Button(
+            label="Configura backup su Google Drive"
+        )
+        self.google_backup_configure.connect(
+            "clicked", lambda *_: self.app.configure_google_drive_backup(self)
+        )
+        google_buttons.attach(self.google_backup_configure, 0, 0, 1, 1)
+
+        self.google_account_settings = Gtk.Button(label="Gestisci account Google")
+        self.google_account_settings.connect(
+            "clicked", lambda *_: self.app.open_google_account_settings(self)
+        )
+        google_buttons.attach(self.google_account_settings, 1, 0, 1, 1)
+
+        self.google_backup_disconnect = Gtk.Button(label="Scollega Google Drive")
+        self.google_backup_disconnect.connect(
+            "clicked", lambda *_: self.app.disconnect_google_drive_backup(self)
+        )
+        google_buttons.attach(self.google_backup_disconnect, 0, 1, 2, 1)
+
+        action_buttons = Gtk.Grid(column_spacing=8, row_spacing=8)
+        action_buttons.set_column_homogeneous(True)
+        backup_box.pack_start(action_buttons, False, False, 0)
+
+        self.backup_now = Gtk.Button(label="Esegui backup adesso")
+        self.backup_now.connect(
+            "clicked", lambda *_: self.app.backup_data(
+                manual=True, parent=self, notify=True
+            )
+        )
+        action_buttons.attach(self.backup_now, 0, 0, 1, 1)
+
+        self.backup_restore = Gtk.Button(label="Ripristina da backup")
+        self.backup_restore.connect(
+            "clicked", lambda *_: self.app.restore_from_backup(self)
+        )
+        action_buttons.attach(self.backup_restore, 1, 0, 1, 1)
+
         grid = Gtk.Grid(column_spacing=12, row_spacing=10)
         grid.set_column_homogeneous(False)
         content.pack_start(grid, False, False, 0)
@@ -3140,7 +3331,152 @@ class SettingsWindow(Gtk.Window):
         close.connect("clicked", lambda *_: self.destroy())
         controls.pack_end(close, False, False, 0)
 
+        self.refresh_backup_ui()
         self.show_all()
+
+    def _backup_frequency_changed(self, *_args) -> None:
+        frequency = self.backup_frequency.get_active_id() or "off"
+        self.app.set_backup_frequency(frequency)
+        self.refresh_backup_ui()
+
+    def _local_backup_enabled_changed(self, *_args) -> None:
+        self.app.set_local_backup_enabled(
+            self.local_backup_enabled.get_active()
+        )
+        self.refresh_backup_ui()
+
+    @staticmethod
+    def _format_backup_time(value: str) -> str:
+        if not value:
+            return ""
+        try:
+            return dt.datetime.fromisoformat(value).astimezone().strftime(
+                "%d/%m/%Y %H:%M"
+            )
+        except Exception:
+            return value
+
+    def refresh_backup_ui(self) -> None:
+        settings = Settings.load()
+        if (
+            self.backup_frequency.get_active_id()
+            != settings.google_drive_backup_frequency
+        ):
+            self.backup_frequency.handler_block_by_func(
+                self._backup_frequency_changed
+            )
+            self.backup_frequency.set_active_id(
+                settings.google_drive_backup_frequency
+            )
+            self.backup_frequency.handler_unblock_by_func(
+                self._backup_frequency_changed
+            )
+        if self.local_backup_enabled.get_active() != settings.local_backup_enabled:
+            self.local_backup_enabled.handler_block_by_func(
+                self._local_backup_enabled_changed
+            )
+            self.local_backup_enabled.set_active(settings.local_backup_enabled)
+            self.local_backup_enabled.handler_unblock_by_func(
+                self._local_backup_enabled_changed
+            )
+
+        local_last = self._format_backup_time(
+            settings.local_backup_last_success_at
+        )
+        local_folder = settings.local_backup_folder or str(DEFAULT_LOCAL_BACKUP_DIR)
+        if not settings.local_backup_enabled:
+            self.local_backup_status.set_text(
+                f"Backup locale disattivato. Cartella predisposta: {local_folder}"
+            )
+        elif settings.local_backup_last_error:
+            self.local_backup_status.set_text(
+                "Copia locale attiva, ma l'ultima operazione ha avuto problemi: "
+                + settings.local_backup_last_error
+                + f"\nCartella: {local_folder}"
+            )
+        else:
+            suffix = f" Ultimo backup: {local_last}." if local_last else ""
+            self.local_backup_status.set_text(
+                f"Copia locale attiva. Cartella: {local_folder}." + suffix
+            )
+
+        configured = bool(settings.google_drive_backup_folder_uri)
+        if not configured:
+            self.google_backup_status.set_text(
+                "Google Drive non configurato. I backup locali continuano a funzionare."
+            )
+            self.google_backup_folder.set_text("")
+            self.google_backup_configure.set_label(
+                "Configura backup su Google Drive"
+            )
+        elif settings.google_drive_backup_last_error:
+            self.google_backup_status.set_text(
+                "La copia locale resta valida. Problema Google Drive: "
+                + settings.google_drive_backup_last_error
+            )
+            self.google_backup_folder.set_text(
+                "Destinazione Google: "
+                + (
+                    settings.google_drive_backup_folder_name
+                    or settings.google_drive_backup_folder_uri
+                )
+            )
+            self.google_backup_configure.set_label(
+                "Cambia cartella Google Drive"
+            )
+        else:
+            drive_last = self._format_backup_time(
+                settings.google_drive_backup_last_success_at
+            )
+            suffix = f" Ultima copia: {drive_last}." if drive_last else ""
+            self.google_backup_status.set_text(
+                "Seconda copia Google Drive configurata." + suffix
+            )
+            self.google_backup_folder.set_text(
+                "Destinazione Google: "
+                + (
+                    settings.google_drive_backup_folder_name
+                    or settings.google_drive_backup_folder_uri
+                )
+            )
+            self.google_backup_configure.set_label(
+                "Cambia cartella Google Drive"
+            )
+
+        frequency = settings.google_drive_backup_frequency
+        destinations = []
+        if settings.local_backup_enabled:
+            destinations.append("locale")
+        if configured:
+            destinations.append("Google Drive")
+        destination_text = (
+            " e ".join(destinations) if destinations else "nessuna destinazione"
+        )
+        if frequency == "daily":
+            self.backup_schedule_info.set_text(
+                "Backup automatico giornaliero alle "
+                f"{settings.morning_start} verso {destination_text}; se il programma "
+                "viene aperto più tardi, parte alla prima apertura utile."
+            )
+        elif frequency == "monthly":
+            self.backup_schedule_info.set_text(
+                "Backup automatico alla prima apertura utile di ogni mese verso "
+                f"{destination_text}."
+            )
+        else:
+            self.backup_schedule_info.set_text(
+                "Backup automatico disattivato; resta disponibile il backup manuale."
+            )
+
+        any_destination = settings.local_backup_enabled or configured
+        self.backup_now.set_sensitive(any_destination)
+        self.backup_restore.set_sensitive(True)
+        self.google_backup_disconnect.set_sensitive(configured)
+        self.local_backup_choose.set_sensitive(settings.local_backup_enabled)
+
+    # Nome mantenuto per compatibilità con le chiamate già presenti.
+    def refresh_google_drive_backup_ui(self) -> None:
+        self.refresh_backup_ui()
 
     def _preview_timer_sound(self, *_args) -> None:
         sound_id = self.timer_end_sound.get_active_id() or "soft"
@@ -3411,6 +3747,10 @@ class WorkBreakApp:
         self.indicator_toggle_item: Optional[Gtk.MenuItem] = None
         self.sound_files: dict[str, Path] = {}
         self.beep_file = self._build_sound_file("soft")
+        self._backup_busy = False
+        self._restored_data_pending_restart = False
+        self._backup_attempted_targets: set[str] = set()
+        self._backup_next_check_monotonic = 0.0
 
         self._setup_indicator_or_control()
         self._restore_latest_activity()
@@ -3561,6 +3901,862 @@ class WorkBreakApp:
             self.settings_window.present()
             return
         self.settings_window = SettingsWindow(self)
+
+    def _update_persisted_backup_settings(self, **values: object) -> Settings:
+        pending = Settings.load()
+        for key, value in values.items():
+            if hasattr(pending, key):
+                setattr(pending, key, value)
+        pending.save()
+        for key in values:
+            if hasattr(self.settings, key):
+                setattr(self.settings, key, getattr(pending, key))
+        self._refresh_google_backup_settings_ui()
+        return pending
+
+    def _refresh_google_backup_settings_ui(self) -> None:
+        if self.settings_window and self.settings_window.get_visible():
+            try:
+                self.settings_window.refresh_backup_ui()
+            except Exception:
+                pass
+
+    def set_backup_frequency(self, frequency: str) -> None:
+        normalized = str(frequency or "off").strip().lower()
+        if normalized not in {"off", "daily", "monthly"}:
+            normalized = "off"
+        self._update_persisted_backup_settings(
+            google_drive_backup_frequency=normalized
+        )
+        self._backup_attempted_targets.clear()
+
+    def set_google_drive_backup_frequency(self, frequency: str) -> None:
+        self.set_backup_frequency(frequency)
+
+    def set_local_backup_enabled(self, enabled: bool) -> None:
+        self._update_persisted_backup_settings(
+            local_backup_enabled=bool(enabled),
+            local_backup_last_error="",
+        )
+        self._backup_attempted_targets.clear()
+
+    def configure_local_backup_folder(
+        self, parent: Optional[Gtk.Window] = None
+    ) -> None:
+        settings = Settings.load()
+        dialog = Gtk.FileChooserDialog(
+            title="Scegli la cartella per i backup locali",
+            parent=parent,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(
+            "Annulla",
+            Gtk.ResponseType.CANCEL,
+            "Usa questa cartella",
+            Gtk.ResponseType.OK,
+        )
+        dialog.set_local_only(True)
+        dialog.set_create_folders(True)
+        try:
+            dialog.set_current_folder(settings.local_backup_folder)
+        except Exception:
+            pass
+        response = dialog.run()
+        folder = dialog.get_filename() if response == Gtk.ResponseType.OK else ""
+        dialog.destroy()
+        if not folder:
+            return
+        try:
+            selected = Path(folder).expanduser().resolve()
+            selected.mkdir(parents=True, exist_ok=True)
+            probe = selected / ".workbreak-guard-write-test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+        except Exception as exc:
+            self._show_backup_message(
+                parent,
+                "Cartella locale non utilizzabile",
+                f"Non posso scrivere nella cartella selezionata: {exc}",
+                error=True,
+            )
+            return
+        self._update_persisted_backup_settings(
+            local_backup_enabled=True,
+            local_backup_folder=str(selected),
+            local_backup_last_error="",
+        )
+        self._backup_attempted_targets.clear()
+        success, message = self.backup_data(
+            manual=True,
+            parent=parent,
+            notify=False,
+            targets={"local"},
+        )
+        self._show_backup_message(
+            parent,
+            "Cartella locale configurata" if success else "Ci sono stati problemi",
+            message,
+            error=not success,
+        )
+
+    @staticmethod
+    def _is_google_drive_uri(uri: str) -> bool:
+        normalized = str(uri or "").lower().replace("%3a", ":")
+        return normalized.startswith("google-drive://") or (
+            normalized.startswith("file://")
+            and "/gvfs/google-drive:" in normalized
+        )
+
+    def _google_drive_mounts(self) -> list[tuple[str, str]]:
+        mounts: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        try:
+            monitor = Gio.VolumeMonitor.get()
+            for mount in monitor.get_mounts():
+                root = mount.get_root()
+                uri = root.get_uri() if root else ""
+                name = str(mount.get_name() or "Google Drive")
+                if self._is_google_drive_uri(uri) and uri not in seen:
+                    seen.add(uri)
+                    mounts.append((name, uri))
+        except Exception:
+            pass
+
+        # Alcune versioni di GVFS non espongono subito il mount al VolumeMonitor,
+        # pur rendendolo già disponibile nel filesystem della sessione utente.
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        gvfs_dir = Path(runtime_dir) / "gvfs"
+        try:
+            for item in gvfs_dir.iterdir():
+                if not item.name.startswith("google-drive:"):
+                    continue
+                uri = item.resolve().as_uri()
+                if uri not in seen:
+                    seen.add(uri)
+                    mounts.append(("Google Drive", uri))
+        except Exception:
+            pass
+        return mounts
+
+    def _show_backup_message(
+        self,
+        parent: Optional[Gtk.Window],
+        title: str,
+        message: str,
+        error: bool = False,
+    ) -> None:
+        dialog = Gtk.MessageDialog(
+            transient_for=parent,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=(Gtk.MessageType.ERROR if error else Gtk.MessageType.INFO),
+            buttons=Gtk.ButtonsType.OK,
+            text=title,
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
+
+    def open_google_account_settings(
+        self, parent: Optional[Gtk.Window] = None
+    ) -> None:
+        if not shutil.which("gnome-control-center"):
+            self._show_backup_message(
+                parent,
+                "Gestione account non disponibile",
+                "Account online di GNOME non è installato. Puoi comunque scegliere "
+                "una cartella locale sincronizzata con Google Drive.",
+                error=True,
+            )
+            return
+        try:
+            subprocess.Popen(
+                ["gnome-control-center", "online-accounts"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self._show_backup_message(
+                parent,
+                "Apertura non riuscita",
+                f"Non è stato possibile aprire la gestione account: {exc}",
+                error=True,
+            )
+
+    def configure_google_drive_backup(
+        self, parent: Optional[Gtk.Window] = None
+    ) -> None:
+        # Non apriamo automaticamente “Aggiungi account”: l'account potrebbe
+        # esistere già ma non essere ancora elencato dal VolumeMonitor.
+        settings = Settings.load()
+        mounts = self._google_drive_mounts()
+        initial_uri = settings.google_drive_backup_folder_uri
+        if not initial_uri and mounts:
+            initial_uri = mounts[0][1]
+        self._choose_google_drive_folder(parent, initial_uri)
+
+    def _choose_google_drive_folder(
+        self,
+        parent: Optional[Gtk.Window],
+        initial_uri: str = "",
+    ) -> None:
+        dialog = Gtk.FileChooserDialog(
+            title="Scegli Google Drive o una cartella sincronizzata",
+            parent=parent,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(
+            "Annulla",
+            Gtk.ResponseType.CANCEL,
+            "Usa questa cartella",
+            Gtk.ResponseType.OK,
+        )
+        dialog.set_local_only(False)
+        dialog.set_create_folders(True)
+        if initial_uri:
+            try:
+                dialog.set_current_folder_uri(initial_uri)
+            except Exception:
+                pass
+        response = dialog.run()
+        uri = dialog.get_uri() if response == Gtk.ResponseType.OK else ""
+        selected_name = dialog.get_filename() or ""
+        dialog.destroy()
+        if not uri:
+            return
+
+        display_name = ""
+        try:
+            folder = Gio.File.new_for_uri(uri)
+            info = folder.query_info(
+                "standard::display-name,standard::type,access::can-write",
+                Gio.FileQueryInfoFlags.NONE,
+                None,
+            )
+            if info.get_file_type() != Gio.FileType.DIRECTORY:
+                raise ValueError("La selezione non è una cartella")
+            if (
+                info.has_attribute("access::can-write")
+                and not info.get_attribute_boolean("access::can-write")
+            ):
+                raise PermissionError("La cartella risulta in sola lettura")
+            display_name = str(info.get_display_name() or "")
+        except Exception as exc:
+            self._show_backup_message(
+                parent,
+                "Ci sono stati problemi",
+                f"La cartella selezionata non è accessibile: {exc}",
+                error=True,
+            )
+            return
+
+        self._update_persisted_backup_settings(
+            google_drive_backup_folder_uri=uri,
+            google_drive_backup_folder_name=(
+                display_name or selected_name or "Google Drive"
+            ),
+            google_drive_backup_last_error="",
+        )
+        self._backup_attempted_targets.clear()
+        success, message = self.backup_data(
+            manual=True,
+            parent=parent,
+            notify=False,
+        )
+        self._show_backup_message(
+            parent,
+            "Tutto ok, configurato" if success else "Ci sono stati problemi",
+            message,
+            error=not success,
+        )
+
+    def disconnect_google_drive_backup(
+        self, parent: Optional[Gtk.Window] = None
+    ) -> None:
+        dialog = Gtk.MessageDialog(
+            transient_for=parent,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text="Scollegare la seconda copia Google Drive?",
+        )
+        dialog.format_secondary_text(
+            "I backup già presenti su Drive non verranno cancellati. "
+            "Il backup locale e la sua pianificazione resteranno attivi."
+        )
+        dialog.add_button("Annulla", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Scollega", Gtk.ResponseType.OK)
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        self._update_persisted_backup_settings(
+            google_drive_backup_folder_uri="",
+            google_drive_backup_folder_name="",
+            google_drive_backup_last_success_at="",
+            google_drive_backup_last_error="",
+            google_drive_backup_last_auto_key="",
+        )
+        self._backup_attempted_targets.clear()
+
+    @staticmethod
+    def _json_from_file(path: Path, required: bool = False) -> object:
+        if not path.exists():
+            if required:
+                raise FileNotFoundError(str(path))
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"JSON non valido in {path.name}: {exc}") from exc
+
+    def _build_backup_payload(self, backup_type: str) -> dict:
+        self._save_activity_log()
+        self._save_runtime_state(force=True)
+        return {
+            "backup_format": "workbreak-guard-portable-json",
+            "schema_version": 1,
+            "application": {
+                "id": APP_ID,
+                "name": APP_NAME,
+            },
+            "created_at": dt.datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            ),
+            "backup_type": backup_type,
+            "data": {
+                "settings.json": self._json_from_file(CONFIG_FILE, required=True),
+                "activity-log.json": self._json_from_file(
+                    ACTIVITY_LOG_FILE, required=False
+                ),
+                "runtime-state.json": self._json_from_file(
+                    RUNTIME_STATE_FILE, required=False
+                ),
+            },
+        }
+
+    def _build_google_drive_backup_payload(self, backup_type: str) -> dict:
+        return self._build_backup_payload(backup_type)
+
+    @staticmethod
+    def _copy_local_file_to_gio(source_path: Path, destination: Gio.File) -> None:
+        source = Gio.File.new_for_path(str(source_path))
+        source.copy(
+            destination,
+            Gio.FileCopyFlags.OVERWRITE,
+            None,
+            None,
+            None,
+        )
+
+    @staticmethod
+    def _copy_gio_file_to_local(source: Gio.File, destination_path: Path) -> None:
+        destination = Gio.File.new_for_path(str(destination_path))
+        source.copy(
+            destination,
+            Gio.FileCopyFlags.OVERWRITE,
+            None,
+            None,
+            None,
+        )
+
+    def _current_backup_schedule_key(
+        self, now: Optional[dt.datetime] = None
+    ) -> str:
+        current = now or dt.datetime.now()
+        frequency = Settings.load().google_drive_backup_frequency
+        if frequency == "daily":
+            return f"daily:{current.date().isoformat()}"
+        if frequency == "monthly":
+            return f"monthly:{current:%Y-%m}"
+        return ""
+
+    @staticmethod
+    def _write_local_backup_file(source: Path, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp = destination.with_name(destination.name + ".tmp")
+        shutil.copy2(source, temp)
+        temp.replace(destination)
+
+    @staticmethod
+    def _friendly_local_backup_error(exc: Exception) -> str:
+        text = str(exc).strip() or exc.__class__.__name__
+        return f"Backup locale non riuscito: {text}"
+
+    @staticmethod
+    def _friendly_google_drive_error(exc: Exception) -> str:
+        text = str(exc).strip() or exc.__class__.__name__
+        lowered = text.lower()
+        if "not mounted" in lowered or "mount" in lowered:
+            return (
+                "Google Drive non è montato. Apri File → Altre posizioni e accedi "
+                "al Drive già collegato, poi scegli nuovamente la cartella."
+            )
+        if (
+            "permission" in lowered
+            or "denied" in lowered
+            or "sola lettura" in lowered
+        ):
+            return (
+                "Google Drive non consente di scrivere nella cartella scelta. "
+                "Seleziona un'altra cartella o verifica i permessi."
+            )
+        if "timed out" in lowered or "timeout" in lowered:
+            return "Connessione a Google Drive scaduta. Controlla Internet e riprova."
+        return f"Backup Google Drive non riuscito: {text}"
+
+    def backup_data(
+        self,
+        manual: bool = False,
+        parent: Optional[Gtk.Window] = None,
+        notify: bool = False,
+        targets: Optional[set[str]] = None,
+    ) -> tuple[bool, str]:
+        if self._backup_busy:
+            message = "Un backup è già in corso."
+            if notify:
+                self._show_backup_message(parent, "Backup già in corso", message)
+            return False, message
+
+        settings = Settings.load()
+        requested = set(targets or ())
+        if not requested:
+            if settings.local_backup_enabled:
+                requested.add("local")
+            if settings.google_drive_backup_folder_uri:
+                requested.add("google")
+        if "local" in requested and not settings.local_backup_enabled:
+            requested.remove("local")
+        if "google" in requested and not settings.google_drive_backup_folder_uri:
+            requested.remove("google")
+        if not requested:
+            message = (
+                "Nessuna destinazione attiva. Abilita il backup locale oppure "
+                "configura Google Drive."
+            )
+            if notify:
+                self._show_backup_message(
+                    parent, "Backup non configurato", message, error=True
+                )
+            return False, message
+
+        self._backup_busy = True
+        temp_path: Optional[Path] = None
+        successes: list[str] = []
+        errors: list[str] = []
+        updates: dict[str, object] = {}
+        schedule_key = "" if manual else self._current_backup_schedule_key()
+        try:
+            payload = self._build_backup_payload(
+                "manual" if manual else "automatic"
+            )
+            timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            filename = f"workbreak-guard-backup-{timestamp}.json"
+            with tempfile.NamedTemporaryFile(
+                prefix="workbreak-guard-backup-",
+                suffix=".json",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+            temp_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            now_text = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+            if "local" in requested:
+                try:
+                    local_dir = Path(settings.local_backup_folder).expanduser()
+                    destination = local_dir / filename
+                    self._write_local_backup_file(temp_path, destination)
+                    successes.append(f"copia locale: {destination}")
+                    updates.update(
+                        local_backup_last_success_at=now_text,
+                        local_backup_last_error="",
+                    )
+                    if schedule_key:
+                        updates["local_backup_last_auto_key"] = schedule_key
+                except Exception as exc:
+                    message = self._friendly_local_backup_error(exc)
+                    errors.append(message)
+                    updates["local_backup_last_error"] = message
+
+            if "google" in requested:
+                try:
+                    folder = Gio.File.new_for_uri(
+                        settings.google_drive_backup_folder_uri
+                    )
+                    info = folder.query_info(
+                        "standard::type",
+                        Gio.FileQueryInfoFlags.NONE,
+                        None,
+                    )
+                    if info.get_file_type() != Gio.FileType.DIRECTORY:
+                        raise ValueError(
+                            "La destinazione Google Drive non è una cartella"
+                        )
+                    destination = folder.get_child(filename)
+                    self._copy_local_file_to_gio(temp_path, destination)
+                    successes.append(
+                        "copia Google Drive: "
+                        + (
+                            settings.google_drive_backup_folder_name
+                            or settings.google_drive_backup_folder_uri
+                        )
+                    )
+                    updates.update(
+                        google_drive_backup_last_success_at=now_text,
+                        google_drive_backup_last_error="",
+                    )
+                    if schedule_key:
+                        updates["google_drive_backup_last_auto_key"] = schedule_key
+                except Exception as exc:
+                    message = self._friendly_google_drive_error(exc)
+                    errors.append(message)
+                    updates["google_drive_backup_last_error"] = message
+
+            if updates:
+                self._update_persisted_backup_settings(**updates)
+
+            lines = []
+            if successes:
+                lines.append("Backup creato correttamente:")
+                lines.extend(f"• {item}" for item in successes)
+            if errors:
+                if lines:
+                    lines.append("")
+                lines.append("Problemi riscontrati:")
+                lines.extend(f"• {item}" for item in errors)
+                if "local" in requested and any(
+                    item.startswith("copia locale:") for item in successes
+                ):
+                    lines.append(
+                        "La copia locale è comunque valida e può essere usata "
+                        "per il ripristino."
+                    )
+            message = "\n".join(lines)
+            complete_success = bool(successes) and not errors
+            if notify:
+                self._show_backup_message(
+                    parent,
+                    (
+                        "Backup completato"
+                        if complete_success
+                        else (
+                            "Backup locale completato con avvisi"
+                            if successes
+                            else "Ci sono stati problemi"
+                        )
+                    ),
+                    message,
+                    error=not successes,
+                )
+            return complete_success, message
+        except Exception as exc:
+            message = f"Impossibile preparare il backup: {exc}"
+            failure_updates: dict[str, object] = {}
+            if "local" in requested:
+                failure_updates["local_backup_last_error"] = message
+            if "google" in requested:
+                failure_updates["google_drive_backup_last_error"] = message
+            if failure_updates:
+                self._update_persisted_backup_settings(**failure_updates)
+            if notify:
+                self._show_backup_message(
+                    parent,
+                    "Ci sono stati problemi",
+                    message,
+                    error=True,
+                )
+            return False, message
+        finally:
+            self._backup_busy = False
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def backup_to_google_drive(
+        self,
+        manual: bool = False,
+        parent: Optional[Gtk.Window] = None,
+        notify: bool = False,
+    ) -> tuple[bool, str]:
+        return self.backup_data(
+            manual=manual,
+            parent=parent,
+            notify=notify,
+            targets={"google"},
+        )
+
+    def _scheduled_backup_due(
+        self, now: dt.datetime, settings: Settings
+    ) -> tuple[bool, str]:
+        frequency = settings.google_drive_backup_frequency
+        if frequency == "daily":
+            scheduled = dt.datetime.combine(
+                now.date(), parse_hhmm(settings.morning_start)
+            )
+            if now < scheduled:
+                return False, ""
+            return True, f"daily:{now.date().isoformat()}"
+        if frequency == "monthly":
+            return True, f"monthly:{now:%Y-%m}"
+        return False, ""
+
+    def _check_scheduled_backup(self, now: dt.datetime) -> None:
+        monotonic_now = time.monotonic()
+        if monotonic_now < self._backup_next_check_monotonic:
+            return
+        self._backup_next_check_monotonic = monotonic_now + 30
+        settings = Settings.load()
+        due, key = self._scheduled_backup_due(now, settings)
+        if not due or not key:
+            return
+
+        targets: set[str] = set()
+        local_attempt = f"local:{key}"
+        google_attempt = f"google:{key}"
+        if (
+            settings.local_backup_enabled
+            and settings.local_backup_last_auto_key != key
+            and local_attempt not in self._backup_attempted_targets
+        ):
+            targets.add("local")
+            self._backup_attempted_targets.add(local_attempt)
+        if (
+            settings.google_drive_backup_folder_uri
+            and settings.google_drive_backup_last_auto_key != key
+            and google_attempt not in self._backup_attempted_targets
+        ):
+            targets.add("google")
+            self._backup_attempted_targets.add(google_attempt)
+        if targets:
+            self.backup_data(manual=False, notify=False, targets=targets)
+
+    def _check_scheduled_google_drive_backup(self, now: dt.datetime) -> None:
+        self._check_scheduled_backup(now)
+
+    @staticmethod
+    def _validate_backup_payload(payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise ValueError("Il file selezionato non contiene un oggetto JSON")
+        if payload.get("backup_format") != "workbreak-guard-portable-json":
+            raise ValueError("Il file non è un backup di WorkBreak Guard")
+        if int(payload.get("schema_version", 0)) != 1:
+            raise ValueError("Versione del backup non supportata")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("Il backup non contiene la sezione dati")
+        settings = data.get("settings.json")
+        activity = data.get("activity-log.json")
+        runtime = data.get("runtime-state.json")
+        if not isinstance(settings, dict):
+            raise ValueError("settings.json mancante o non valido")
+        if activity is not None and not isinstance(activity, dict):
+            raise ValueError("activity-log.json non valido")
+        if runtime is not None and not isinstance(runtime, dict):
+            raise ValueError("runtime-state.json non valido")
+        return payload
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(path.suffix + ".restore.tmp")
+        temp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temp.replace(path)
+
+    def _write_local_restore_safety_backup(self) -> Path:
+        RESTORE_SAFETY_DIR.mkdir(parents=True, exist_ok=True)
+        payload = self._build_backup_payload("pre-restore-safety")
+        filename = (
+            "workbreak-guard-before-restore-"
+            + dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            + ".json"
+        )
+        path = RESTORE_SAFETY_DIR / filename
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return path
+
+    def _apply_restored_backup(self, payload: dict) -> Path:
+        safety_path = self._write_local_restore_safety_backup()
+        current = Settings.load()
+        data = payload["data"]
+        restored_settings = dict(data["settings.json"])
+        preserved_fields = (
+            "local_backup_enabled",
+            "local_backup_folder",
+            "local_backup_last_success_at",
+            "local_backup_last_error",
+            "local_backup_last_auto_key",
+            "google_drive_backup_frequency",
+            "google_drive_backup_folder_uri",
+            "google_drive_backup_folder_name",
+            "google_drive_backup_last_success_at",
+            "google_drive_backup_last_error",
+            "google_drive_backup_last_auto_key",
+        )
+        for field_name in preserved_fields:
+            restored_settings[field_name] = getattr(current, field_name)
+
+        self._atomic_write_json(CONFIG_FILE, restored_settings)
+        activity = data.get("activity-log.json")
+        if activity is None:
+            activity = {
+                "schema_version": 6,
+                "days": {},
+                "projects": {},
+                "balance_enabled_from": dt.date.today().isoformat(),
+                "balance_settlements": {},
+            }
+        self._atomic_write_json(ACTIVITY_LOG_FILE, activity)
+        runtime = data.get("runtime-state.json")
+        if runtime is None:
+            try:
+                RUNTIME_STATE_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            self._atomic_write_json(RUNTIME_STATE_FILE, runtime)
+        self.activity_log = self._load_activity_log()
+        self._restored_data_pending_restart = True
+        self._refresh_google_backup_settings_ui()
+        return safety_path
+
+    def _restart_after_restore(self) -> None:
+        try:
+            self._remove_pid_file()
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--autostart"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self._show_backup_message(
+                self.settings_window,
+                "Riavvio non riuscito",
+                f"Chiudi e riapri manualmente WorkBreak Guard: {exc}",
+                error=True,
+            )
+            return
+        Gtk.main_quit()
+
+    def restore_from_backup(
+        self, parent: Optional[Gtk.Window] = None
+    ) -> None:
+        settings = Settings.load()
+        dialog = Gtk.FileChooserDialog(
+            title="Scegli il backup WorkBreak Guard da ripristinare",
+            parent=parent,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.add_buttons(
+            "Annulla",
+            Gtk.ResponseType.CANCEL,
+            "Ripristina questo backup",
+            Gtk.ResponseType.OK,
+        )
+        dialog.set_local_only(False)
+        local_folder = Path(settings.local_backup_folder).expanduser()
+        try:
+            if local_folder.exists():
+                dialog.set_current_folder(str(local_folder))
+            elif settings.google_drive_backup_folder_uri:
+                dialog.set_current_folder_uri(
+                    settings.google_drive_backup_folder_uri
+                )
+        except Exception:
+            pass
+        file_filter = Gtk.FileFilter()
+        file_filter.set_name("Backup JSON WorkBreak Guard")
+        file_filter.add_pattern("workbreak-guard-backup-*.json")
+        file_filter.add_pattern("*.json")
+        dialog.add_filter(file_filter)
+        response = dialog.run()
+        selected_uri = dialog.get_uri() if response == Gtk.ResponseType.OK else ""
+        dialog.destroy()
+        if not selected_uri:
+            return
+
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="workbreak-guard-restore-",
+                suffix=".json",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+            self._copy_gio_file_to_local(
+                Gio.File.new_for_uri(selected_uri), temp_path
+            )
+            payload = self._validate_backup_payload(
+                json.loads(temp_path.read_text(encoding="utf-8"))
+            )
+            created_at = str(payload.get("created_at", "data sconosciuta"))
+            confirm = Gtk.MessageDialog(
+                transient_for=parent,
+                flags=Gtk.DialogFlags.MODAL,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Ripristinare il backup selezionato?",
+            )
+            confirm.format_secondary_text(
+                f"Backup creato: {created_at}\n\n"
+                "Impostazioni, attività e stato salvato verranno sostituiti. "
+                "Prima del ripristino sarà creato automaticamente un backup "
+                "di sicurezza locale."
+            )
+            confirm.add_button("Annulla", Gtk.ResponseType.CANCEL)
+            confirm.add_button("Ripristina", Gtk.ResponseType.OK)
+            confirmed = confirm.run()
+            confirm.destroy()
+            if confirmed != Gtk.ResponseType.OK:
+                return
+            safety_path = self._apply_restored_backup(payload)
+            completed = Gtk.MessageDialog(
+                transient_for=parent,
+                flags=Gtk.DialogFlags.MODAL,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Ripristino completato",
+            )
+            completed.format_secondary_text(
+                "I dati sono stati ripristinati e il timer è stato congelato per "
+                "evitare di sovrascrivere lo stato recuperato.\n\n"
+                f"Backup di sicurezza locale: {safety_path}"
+            )
+            completed.add_button("Riavvierò più tardi", Gtk.ResponseType.CANCEL)
+            completed.add_button("Riavvia ora", Gtk.ResponseType.OK)
+            restart_response = completed.run()
+            completed.destroy()
+            if restart_response == Gtk.ResponseType.OK:
+                self._restart_after_restore()
+        except Exception as exc:
+            self._show_backup_message(
+                parent,
+                "Ci sono stati problemi",
+                f"Ripristino non riuscito: {exc}",
+                error=True,
+            )
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def restore_from_google_drive(
+        self, parent: Optional[Gtk.Window] = None
+    ) -> None:
+        self.restore_from_backup(parent)
 
     def show_day_off_manager(self) -> None:
         if self.day_off_window and self.day_off_window.get_visible():
@@ -4332,6 +5528,8 @@ class WorkBreakApp:
             pass
 
     def _save_runtime_state(self, force: bool = False) -> None:
+        if getattr(self, "_restored_data_pending_restart", False):
+            return
         if not force:
             self.runtime_save_counter += 1
             if self.runtime_save_counter < 5:
@@ -4581,7 +5779,12 @@ class WorkBreakApp:
 
     def tick(self) -> bool:
         now = dt.datetime.now()
+        if self._restored_data_pending_restart:
+            self.clock.hide()
+            self._update_ui()
+            return True
         self._ensure_due_balance_settlements(now.date())
+        self._check_scheduled_backup(now)
 
         if not self.settings.enabled:
             # Timer e fasi restano completamente congelati finché l'utente non
