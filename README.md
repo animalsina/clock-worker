@@ -1,309 +1,363 @@
 # WorkBreak Guard
 
-Promemoria pause per Ubuntu/Wayland, pensato per chi lavora molte ore al PC.
+WorkBreak Guard è un’applicazione per Ubuntu e ambienti desktop Linux, progettata per gestire pause, tempo di lavoro, attività, obiettivi giornalieri, saldi orari e straordinari.
 
-## Cosa fa
+L’applicazione funziona tramite area di notifica AppIndicator, con una finestra di controllo alternativa quando il pannello non supporta correttamente la tray.
 
-- Gestisce separatamente la fascia del mattino e quella del pomeriggio.
-- All’ingresso in **Mattina inizio** e **Pomeriggio inizio** azzera il ciclo, ma applica sempre un limite forzato all’orario di fine della fascia: il timer parte dal valore minore tra i minuti configurati e il tempo realmente rimasto. Per esempio, alle 12:38 con **Mattina fine** alle 13:00 mostra 22 minuti, non 60.
-- Non avvia automaticamente il conteggio: mostra prima la richiesta **“Possiamo iniziare la mattina/pomeriggio?”**.
-- Nella stessa richiesta permette di indicare **progetto** e **attività**, continuare quella corrente oppure riprendere una voce usata oggi o ieri.
-- Conta automaticamente nei giorni e nelle fasce configurate, ma permette anche di iniziare manualmente prima dell’orario o in una giornata esclusa.
-- **Inizia a lavorare adesso** apre la stessa scelta progetto/attività e avvia immediatamente il conteggio; il lavoro anticipato riduce il deficit giornaliero e l’eventuale eccedenza confluisce nel saldo.
-- **Pausa manuale…** permette pause rapide da 5, 10, 15, 30 o 60 minuti, una durata personalizzata fino a 12 ore oppure una pausa senza scadenza.
-- Le pause manuali vengono registrate come pause effettive ma non sono accreditate nell’obiettivo giornaliero, quindi generano correttamente un eventuale deficit.
-- **Termina la giornata adesso** ferma immediatamente ogni conteggio, fotografa il saldo del momento e lascia disponibile **Riprendi la giornata adesso** per ricominciare più tardi nello stesso giorno.
-- Alla fine della fascia mattutina o pomeridiana non interrompe il lavoro automaticamente: chiede se stai ancora lavorando.
-- Premendo **Sto continuando** conteggia anche il tempo trascorso dalla fine prevista e ripropone l’avviso ogni intervallo configurato, 10 minuti per impostazione predefinita.
-- Se non rispondi entro 20 minuti, evita falsi positivi e considera come ultimo momento lavorato l’orario previsto oppure l’ultimo avviso a cui avevi confermato di continuare.
-- Quando termini il mattino, il countdown centrale usa come riferimento **Pomeriggio inizio** se la pausa è cominciata puntualmente o in anticipo. Se la pausa è iniziata dopo **Mattina fine**, il rientro viene spostato dello stesso ritardo per garantire l’intera pausa prevista.
-- Quando il recupero arriva a `00:00` e non hai ancora confermato il rientro, continua in negativo (`-00:01`, `-00:02`, …). Tutto il tempo negativo resta pausa effettiva e aumenta il deficit; il ritardo iniziale non viene conteggiato due volte quando la pausa è partita tardi.
-- Il countdown di recupero può essere interrotto con **Interrompi e ricomincia a lavorare**; da quel momento l’app considera già avviato il pomeriggio senza mostrare un secondo avviso di inizio.
-- Calcola automaticamente le festività nazionali italiane, compreso il lunedì dell’Angelo e, dal 2026, il 4 ottobre; può inoltre includere i patroni di Este e Firenze.
-- Non recupera le ore perse: se il PC è spento o l’app non gira, il timer non accumula arretrati.
-- Alla scadenza del tempo di lavoro chiede quale ultimatum usare:
-  - tempo predefinito configurato;
-  - 5 minuti;
-  - 10 minuti;
-  - **Inizia subito la pausa**, senza passare da “Fermati subito!”.
-- Nella scelta dell’ultimatum, nella schermata **“Fermati subito!”** e nella selezione della durata è disponibile **Salta pausa e continua il lavoro**: non registra alcuna pausa e avvia subito un nuovo blocco di lavoro sull’attività corrente.
-- Quando la pausa viene realmente avviata permette di scegliere ogni volta **5, 10 o 15 minuti**, oppure una durata personalizzata fino a 12 ore.
-- La pausa ciclica concorre all’obiettivo giornaliero entro due quote: **10 minuti per ciascun blocco iniziato di 2 ore lavorate** e un **abbuono extra giornaliero di 20 minuti**, entrambi configurabili. Con una giornata da 8 ore il valore predefinito è quindi **40 minuti regolari + 20 minuti extra**. Soltanto la parte che supera il tetto giornaliero diventa tempo da recuperare.
-- Il limite della singola pausa resta quello configurato, 10 minuti per impostazione predefinita: scegliendo 5 minuti, anche gli eventuali 5 minuti successivi trascorsi nella schermata di rientro possono essere abbuonati. Dall’undicesimo minuto la pausa produce recupero, oppure prima quando il plafond giornaliero è già esaurito.
-- Dopo la scelta, il countdown non resta in una finestra: viene mostrato accanto all’icona nella barra di sistema.
-- Anche mentre scegli l’ultimatum o mentre è aperto **“Fermati subito!”**, il lavoro continua a essere conteggiato fino a quando premi **Ho iniziato la pausa**.
-- Anche il countdown della pausa resta nella barra e non apre una finestra centrale dedicata.
-- Al termine della pausa chiede **“Cosa stai facendo adesso?”**, con possibilità di continuare, cambiare attività o riprenderne una di oggi/ieri.
-- Nella stessa schermata di rientro mostra due conteggi aggiornati ogni secondo: **quanto tempo è trascorso dalla fine prevista della pausa**, nel formato negativo `-00:30`, e **quanto stai superando la quota realmente abbuonata**. Per esempio, dopo una pausa effettiva di 15 minuti con 10 minuti abbuonati e 30 secondi di ritardo mostra `Pausa terminata da: -00:30` e `Sforamento oltre i 10:00 abbuonati: -05:30`.
-- Registra i secondi di lavoro effettivo e di pausa effettiva, includendo l’eventuale tempo oltre la fine della pausa fino alla conferma del rientro.
-- Per l’obiettivo giornaliero considera **lavoro effettivo + quota abbuonabile delle pause regolari**. I minuti entro il plafond giornaliero non aumentano le ore mancanti; soltanto l’eccedenza oltre il limite della singola pausa o oltre il plafond complessivo resta da recuperare. I minuti lavorati oltre la fine della fascia sono sempre lavoro effettivo e compensano immediatamente il deficit.
-- Se una pausa pomeridiana oltrepasserebbe l’orario di chiusura, la sua durata viene automaticamente troncata ai soli minuti ancora disponibili prima della fine giornata. Il tempo successivo non viene accreditato come lavoro.
-- Permette di impostare il **tempo massimo per giornata**, 8 ore per impostazione predefinita, e mostra continuamente quanto manca al completamento.
-- Mantiene un **saldo ore** tra le giornate lavorative: il tempo lavorato in più compensa prima eventuali ore mancanti; soltanto il surplus residuo resta disponibile come credito.
-- Alla chiusura del pomeriggio, quando il saldo resta negativo, mostra due scelte:
-  - **Compensa post chiusura**, continuando il conteggio con un countdown centrale fino all’azzeramento del debito;
-  - **Posticipa al prossimo giorno**, conservando il residuo e sommandolo al conteggio del prossimo giorno lavorativo.
-- Durante la compensazione post chiusura puoi premere **Concludi definitivamente adesso** in qualsiasi momento: la giornata viene chiusa subito e soltanto il residuo ancora mancante viene rinviato.
-- Il saldo positivo viene chiuso una volta al mese. Nelle impostazioni puoi scegliere il giorno base del mese e il primo giorno della settimana uguale o successivo, per esempio il primo lunedì o venerdì dopo la data indicata.
-- Alla chiusura mensile il saldo positivo diventa **EXTRA da saldo chiuso** e riparte da zero; un eventuale saldo negativo continua invece a essere riportato finché non viene recuperato.
-- Calcola il limite ordinario settimanale come **tempo massimo per giornata × numero di giorni attivi**. Tutto ciò che supera questo valore viene classificato come **EXTRA settimanale**.
-- Le ore lavorate in festività, ferie o giorni normalmente non lavorativi vengono classificate integralmente come **EXTRA festivo/ferie** e restano separate dal monte ordinario settimanale.
-- Attribuisce ogni secondo di lavoro alla coppia **Progetto + Attività**, così è possibile passare da un lavoro all’altro senza perdere i tempi.
-- Alla fine della fascia pomeridiana mostra il riepilogo giornaliero completo, con lavoro, pause, obiettivo giornaliero, straordinario oltre fascia, EXTRA settimanale, EXTRA festivo/ferie e tempo impiegato per ogni attività.
-- La finestra **Attività e tempi** è consultabile da **Impostazioni** o dalla finestra di controllo e permette di scorrere i giorni. Mostra anche i totali settimanali e mensili e il riporto del mese precedente.
-- Da **Attività e tempi** puoi aggiungere manualmente nuove righe, modificare progetto, attività e durata, trasferire tutto o parte del tempo di un task verso un altro task della stessa giornata, oppure eliminare una voce. Il trasferimento non modifica il totale lavorato, il saldo o gli straordinari giornalieri.
-- Anche **Tempo precedente non classificato** è modificabile: lasciando vuota l’attività puoi correggerne soltanto la durata, compilando progetto e attività puoi classificarlo, oppure puoi eliminarlo e sottrarlo dal totale giornaliero.
-- **Mostra riepilogo** è disponibile direttamente dal menu dell’icona e dentro **Attività e tempi**. La finestra apre per primo **Grafico**, con avanzamento dell’obiettivo, indicatori di lavoro/pausa/saldo e barre ordinate per progetto e attività; segue **Solo testo**, con sezioni leggibili e durata sempre visibile per ogni task; infine **Markdown**, con titolo nel formato `02 dic 2026`, testo modificabile e copia negli appunti. Testo e Markdown hanno pulsanti di copia separati.
-- Conserva attività, progetti e straordinari per 24 mesi. I progetti già usati vengono proposti con ricerca rapida.
-- Il comando **Resetta e comincia adesso**, spostato nella sezione **Azioni programma** delle impostazioni, annulla pausa, ultimatum o attese e riporta subito il timer al valore completo configurato.
-- Se chiudi e riapri il programma nello stesso giorno, riprende esattamente dal punto interrotto: tempo di lavoro, ultimatum, pausa normale o manuale, pausa senza scadenza, giornata sospesa, progetto e attività corrente.
-- Il tempo trascorso mentre il programma è chiuso non viene scalato. Se nel frattempo cambia fascia o giornata, viene applicato il normale reset di inizio mattina/pomeriggio.
-- **Disattiva Promemoria** non cancella più lo stato: congela lavoro, ultimatum, pausa, rientro o recupero esattamente al secondo corrente. Alla riattivazione viene chiesto se continuare dal residuo oppure ricominciare il conteggio.
-- La scorciatoia globale **Ctrl + Alt + Q** apre direttamente **“Cosa stai facendo adesso?”**, anche mentre stai usando un altro programma.
-- Le finestre di avviso rapide vengono mostrate in alto a destra sul monitor in cui si trova il puntatore, senza rubare il focus alla tastiera. I pulsanti restano disabilitati per i primi 800 ms per evitare selezioni involontarie causate dal clic già in corso.
-- Alla scadenza dei timer permette di scegliere tra nessun suono, beep morbido, doppio beep o campanello; nelle impostazioni è disponibile anche il pulsante **Prova**. Durante la pausa può continuare a emettere beep lievi periodici, configurabili e disattivabili.
-- Aggiunge una voce nella tray/barra se AppIndicator è disponibile; altrimenti usa una piccola finestra di controllo.
+## Funzionalità principali
 
-## Installazione
+- gestione separata delle fasce lavorative mattutina e pomeridiana;
+- cicli configurabili di lavoro e pausa;
+- tracciamento del tempo per progetto e attività;
+- obiettivo giornaliero e saldo tra giornate lavorative;
+- gestione di pause regolari, pause manuali e rientri in ritardo;
+- classificazione automatica di straordinari ed EXTRA;
+- festività italiane, ferie e giornate lavorative straordinarie;
+- riepiloghi giornalieri, settimanali e mensili;
+- persistenza dello stato dopo la chiusura del programma;
+- backup locale e seconda copia opzionale su Google Drive;
+- scorciatoia globale per cambiare rapidamente attività.
 
-```bash
-unzip workbreak-guard.zip
-cd workbreak-guard
-sudo apt-get install -y python3-gi gir1.2-gtk-3.0 pulseaudio-utils gir1.2-ayatanaappindicator3-0.1 gnome-shell-extension-appindicator
-./install.sh
-workbreak-guard
-```
+---
 
-L’installazione abilita l’avvio automatico. Se una versione installata è già in esecuzione, `install.sh` la chiude prima di sostituire i file e avvia automaticamente la nuova versione. Se il programma era chiuso, al termine dell’installazione resta chiuso.
+## Modello di funzionamento
 
-Per installare senza avvio automatico:
+### Fasce lavorative
 
-```bash
-./install.sh --no-autostart
-```
+È possibile configurare:
 
-Su Ubuntu/GNOME la tray può dipendere dall’estensione AppIndicator. Se non compare, l’app resta utilizzabile tramite la finestra di controllo.
-
-## Configurazione
-
-Apri **Impostazioni** dal menu tray o dalla finestra di controllo. La finestra si adatta allo schermo, ha una scrollbar verticale e mantiene sempre raggiungibili i pulsanti inferiori. In alto, la sezione **Azioni programma** dispone i comandi spostati dal menu dell’icona in due colonne.
-
-Salvare le impostazioni non riavvia, non azzera e non sospende il timer, e non apre più richieste del tipo “continui da dove interrotto?”. Le opzioni strutturali contrassegnate con **↻** — durata dei cicli, obiettivo giornaliero, fasce, giorni, festività, quote pausa e chiusura mensile — vengono salvate e applicate al prossimo avvio del programma. Audio, suono, volume, beep, formato Markdown e avvio automatico possono invece essere applicati immediatamente. Lo stato dei promemoria si cambia soltanto tramite **Disattiva/Riattiva promemoria**, senza passare dal pulsante Salva.
-
-Puoi modificare:
-
-- stato dei promemoria tramite il comando dedicato, senza coinvolgere il salvataggio;
-- avvio automatico all’accesso;
-- minuti di lavoro;
-- minuti di pausa ciclica;
-- quota regolare di pausa per ogni blocco di 2 ore lavorate e limite della singola pausa, predefinita a 10 minuti;
-- abbuono extra giornaliero delle pause, predefinito a 20 minuti: con 8 ore di lavoro porta il plafond standard da 40 a 60 minuti;
-- pause manuali avviabili in qualsiasi momento, con durata definita o senza scadenza;
-- tempo massimo per giornata, predefinito a 8 ore;
-- giorno base del mese per la chiusura del saldo EXTRA;
-- giorno della settimana usato per la chiusura mensile, ad esempio lunedì o venerdì;
-- tempo predefinito prima di “Fermati subito!”;
-- intervallo dei promemoria quando continui a lavorare oltre la fine fascia, predefinito a 10 minuti;
-- fasce orarie mattina/pomeriggio;
+- inizio e fine della fascia mattutina;
+- inizio e fine della fascia pomeridiana;
 - giorni attivi;
-- esclusione delle festività nazionali italiane;
-- festività patronali di Este (23 settembre) e Firenze (24 giugno), attivabili separatamente;
-- ferie, assenze e festività personalizzate aggiungibili come giorno singolo o intervallo;
-- giornate lavorative straordinarie, utili per autorizzare il timer durante festività, ferie, weekend o altri giorni esclusi;
-- ricorrenza annuale automatica per le date personalizzate che devono valere anche negli anni successivi;
-- audio on/off;
-- suono alla scadenza dei timer: nessuno, beep morbido, doppio beep o campanello, con anteprima tramite **Prova**;
-- volume beep;
-- numero beep e distanza in secondi;
-- inclusione facoltativa del tempo impiegato accanto a ogni task nel riepilogo Markdown, disattivata per impostazione predefinita;
-- backup JSON locale indipendente da Google, attivo per impostazione predefinita;
-- seconda copia opzionale su Google Drive o in una cartella locale già sincronizzata con Drive;
-- backup manuale unico verso tutte le destinazioni configurate;
-- backup automatico giornaliero all’orario di apertura mattutina oppure mensile alla prima apertura utile;
-- ripristino da un backup locale o remoto con conferma e creazione preventiva di una copia locale di sicurezza.
+- obiettivo massimo giornaliero;
+- durata dei cicli di lavoro e delle pause.
 
-### Backup locale e Google Drive
+Il timer parte automaticamente soltanto nei giorni e nelle fasce configurate. È comunque possibile avviare manualmente una sessione:
 
-Nelle impostazioni, la sezione **Backup dati locale e Google Drive** gestisce due destinazioni indipendenti:
+- prima dell’inizio della mattina;
+- durante l’intervallo tra mattina e pomeriggio;
+- dopo una chiusura anticipata;
+- durante ferie, festività o giorni normalmente non lavorativi.
 
-1. **copia locale**, disponibile senza login e attiva per impostazione predefinita;
-2. **seconda copia Google Drive**, facoltativa.
+Il tempo lavorato nei giorni esclusi viene classificato come **EXTRA festivo/ferie**.
 
-La cartella locale predefinita è:
+### Inizio del lavoro
+
+All’avvio di una sessione viene richiesta la coppia:
 
 ```text
-~/.config/workbreak-guard/backups/
+Progetto + Attività
 ```
 
-Puoi cambiarla con **Scegli cartella locale** oppure disattivare la copia locale. Il pulsante **Esegui backup adesso** crea un solo file JSON e prova a copiarlo in tutte le destinazioni abilitate. Se Google Drive fallisce, la copia locale rimane valida e il programma mostra separatamente l’errore remoto.
+È possibile:
 
-Per configurare Google Drive:
+- continuare l’attività corrente;
+- riprendere un’attività usata oggi o ieri;
+- creare una nuova attività;
+- cercare un progetto già utilizzato.
 
-1. premi **Configura backup su Google Drive**;
-2. nel selettore apri **Altre posizioni** e scegli il Google Drive già collegato;
-3. non è necessario aggiungere nuovamente un account esistente;
-4. in alternativa puoi scegliere una normale cartella locale già sincronizzata con Drive, per esempio tramite un mount esterno;
-5. il programma crea subito una copia di verifica e mostra **Tutto ok, configurato** oppure il problema rilevato.
+Ogni secondo di lavoro viene attribuito all’attività selezionata.
 
-**Gestisci account Google** apre Account online di GNOME solo quando vuoi realmente aggiungere, rimuovere o correggere un account. Non viene più aperto automaticamente dal flusso di configurazione, evitando il tentativo di duplicare un account già presente.
+### Fine della fascia
 
-I backup sono file autonomi con nome simile a:
+Alla fine della fascia mattutina o pomeridiana il conteggio non viene interrotto automaticamente.
+
+L’applicazione chiede se il lavoro sta continuando. In caso di conferma:
+
+- il tempo successivo viene registrato come lavoro effettivo;
+- l’avviso viene ripetuto secondo l’intervallo configurato;
+- il lavoro oltre la fascia contribuisce a compensare eventuali ore mancanti.
+
+Se l’avviso non riceve risposta entro 20 minuti, il tempo viene chiuso all’ultimo momento confermato, evitando di registrare lavoro non effettivamente svolto.
+
+---
+
+## Cicli di lavoro e pause
+
+### Scadenza del ciclo
+
+Quando termina un ciclo di lavoro è possibile scegliere:
+
+- l’ultimatum predefinito;
+- 5 minuti;
+- 10 minuti;
+- avvio immediato della pausa;
+- prosecuzione del lavoro senza registrare alcuna pausa.
+
+Il lavoro continua a essere conteggiato fino alla conferma effettiva dell’inizio della pausa.
+
+### Durata della pausa
+
+Per ogni pausa ciclica è possibile scegliere:
+
+- 5 minuti;
+- 10 minuti;
+- 15 minuti;
+- una durata personalizzata fino a 12 ore.
+
+Durante la pausa il countdown viene mostrato nell’area di notifica.
+
+Al termine viene richiesta la nuova attività. Il tempo trascorso tra la fine prevista della pausa e la conferma del rientro rimane registrato come pausa effettiva.
+
+### Pause manuali
+
+Dal comando **Metti in pausa** è possibile avviare:
+
+- una pausa da 5, 10, 15, 30 o 60 minuti;
+- una pausa personalizzata da 1 a 720 minuti;
+- una pausa senza scadenza.
+
+Le pause manuali interrompono il lavoro e vengono registrate nello storico, ma non vengono considerate tempo utile per il raggiungimento dell’obiettivo giornaliero.
+
+Possono essere interrotte in qualsiasi momento con **Riprendi il lavoro adesso**.
+
+---
+
+## Abbuono delle pause regolari
+
+Le pause cicliche possono contribuire al completamento dell’obiettivo giornaliero entro un plafond configurabile.
+
+Il valore predefinito è composto da:
 
 ```text
-workbreak-guard-backup-2026-07-17_183000.json
+10 minuti per ogni blocco iniziato di 2 ore lavorate
++ 20 minuti di abbuono extra giornaliero
 ```
 
-Ogni file contiene in forma leggibile:
-
-- `settings.json`;
-- `activity-log.json`;
-- `runtime-state.json`, quando presente;
-- data, tipo e versione del formato di backup.
-
-La frequenza condivisa può essere **Disattivata**, **Ogni giorno all’apertura mattutina** oppure **Ogni mese alla prima apertura**. Per il giornaliero viene usato l’orario **Mattina inizio**; se il programma viene aperto più tardi, il backup parte alla prima apertura utile della giornata. Ogni destinazione conserva il proprio stato: se la copia locale riesce e Drive fallisce, al successivo avvio Drive può essere ritentato senza rigenerare inutilmente la copia locale già completata.
-
-**Ripristina da backup** apre un selettore che permette di scegliere sia un JSON locale sia un file raggiungibile tramite Google Drive. Prima di sostituire i dati, l’app crea automaticamente una copia locale in:
+Con una giornata da 8 ore:
 
 ```text
-~/.config/workbreak-guard/restore-safety/
+Quota regolare:             10 min × 4 blocchi = 40 min
+Abbuono extra giornaliero:                   + 20 min
+Plafond totale:                                60 min
 ```
 
-Dopo il ripristino il timer viene congelato per impedire che lo stato appena recuperato venga sovrascritto. Puoi scegliere **Riavvia ora** oppure riaprire manualmente WorkBreak Guard in seguito.
+Il tempo di pausa entro il plafond viene considerato utile per l’obiettivo giornaliero. Diventa invece tempo da recuperare:
 
-Con i valori predefiniti, una giornata da 8 ore funziona così:
+- la parte che supera il limite della singola pausa;
+- la parte che supera il plafond giornaliero complessivo.
+
+Il limite della singola pausa è configurabile e vale 10 minuti per impostazione predefinita.
+
+Esempio: una pausa impostata a 5 minuti può arrivare a 10 minuti senza generare deficit, purché il plafond giornaliero non sia già esaurito. Dall’undicesimo minuto il tempo eccedente viene sottratto dal completamento della giornata.
+
+Le pause manuali sono sempre escluse da questo meccanismo.
+
+---
+
+## Pausa tra mattina e pomeriggio
+
+Se la fascia mattutina termina puntualmente o in anticipo, il rientro viene calcolato rispetto a **Pomeriggio inizio**.
+
+Se il lavoro mattutino termina in ritardo, l’inizio del pomeriggio viene posticipato dello stesso intervallo, in modo da preservare la pausa prevista.
+
+Quando il countdown raggiunge zero senza conferma del rientro, continua con valori negativi:
 
 ```text
-Quota regolare:             10 min × 4 blocchi da 2 ore = 40 min
-Abbuono extra giornaliero:                              + 20 min
-Pausa complessiva utile:                                  60 min
+-00:01
+-00:02
+-00:03
 ```
 
-Per esempio, una pausa impostata a 5 minuti può durare 10 minuti senza creare deficit, finché resta disponibile il plafond giornaliero. Il tempo dall’undicesimo minuto in poi viene invece sottratto dal completamento delle ore giornaliere.
+Il tempo negativo resta pausa effettiva e aumenta il deficit.
 
-Il file delle impostazioni è qui:
+Il recupero può essere interrotto con **Interrompi e ricomincia a lavorare**. In questo caso la sessione pomeridiana viene avviata immediatamente.
+
+---
+
+## Obiettivo giornaliero e saldo ore
+
+L’obiettivo giornaliero è configurabile e vale 8 ore per impostazione predefinita.
+
+Per il suo completamento vengono considerati:
 
 ```text
-~/.config/workbreak-guard/settings.json
+lavoro effettivo
++ quota abbuonata delle pause cicliche
 ```
 
-Le statistiche giornaliere, i progetti e i tempi dettagliati delle attività sono qui:
+Non vengono considerate:
+
+- pause manuali;
+- pause oltre il plafond;
+- tempo trascorso con il programma chiuso;
+- tempo non confermato dopo la fine della fascia.
+
+Il saldo viene mantenuto tra le giornate lavorative:
+
+- il lavoro in più compensa prima eventuali ore mancanti;
+- soltanto il surplus residuo diventa credito;
+- un saldo negativo viene riportato finché non viene recuperato.
+
+### Chiusura con saldo negativo
+
+Alla fine della giornata è possibile:
+
+- continuare a lavorare fino all’azzeramento del debito;
+- rinviare il residuo al giorno lavorativo successivo.
+
+Durante la compensazione è disponibile **Concludi definitivamente adesso**, che chiude la giornata e riporta soltanto il debito ancora presente.
+
+### Chiusura mensile
+
+Il saldo positivo può essere chiuso automaticamente una volta al mese.
+
+È possibile configurare:
+
+- il giorno base del mese;
+- il primo giorno della settimana uguale o successivo al giorno base.
+
+Alla chiusura:
+
+- il saldo positivo diventa **EXTRA da saldo chiuso**;
+- il saldo ordinario riparte da zero;
+- un saldo negativo continua a essere riportato.
+
+---
+
+## Straordinari ed EXTRA
+
+WorkBreak Guard distingue diverse categorie di tempo aggiuntivo.
+
+### Straordinario oltre fascia
+
+È il lavoro effettivo svolto dopo la fine prevista della fascia.
+
+Contribuisce prima al completamento dell’obiettivo e alla compensazione del saldo negativo.
+
+### EXTRA settimanale
+
+Il limite ordinario settimanale viene calcolato come:
 
 ```text
-~/.config/workbreak-guard/activity-log.json
+obiettivo giornaliero × numero di giorni attivi
 ```
 
-Lo stato temporaneo necessario a riprendere il timer dopo la chiusura è salvato qui:
+Il tempo che supera questo limite viene classificato come **EXTRA settimanale**.
 
-```text
-~/.config/workbreak-guard/runtime-state.json
-```
+### EXTRA festivo/ferie
 
-## Voci nella barra
+Il lavoro svolto durante:
 
-Quando il pannello supporta le etichette AppIndicator, accanto all’icona vengono mostrati stati compatti come:
+- festività;
+- ferie;
+- weekend esclusi;
+- altri giorni normalmente non lavorativi;
 
-- `52m`: tempo al prossimo ciclo;
-- `! 05:00`: ultimatum prima della pausa;
-- `☕ 04:30`: pausa in corso;
-- `START`: attesa della conferma di inizio mattina/pomeriggio;
-- `FINE`: giornata terminata anticipatamente ma ancora riapribile;
-- `☕ ∞`: pausa manuale senza scadenza;
-- `Rientro -00:30`: pausa terminata da 30 secondi, in attesa della conferma;
-- `STOP`: pausa da iniziare immediatamente;
-- `Fine?`: attesa della conferma alla fine della fascia;
-- `Saldo?`: scelta tra compensazione post chiusura e rinvio;
-- `↥ 01:00`: compensazione del saldo mancante in corso;
-- `+ 12:30`: lavoro confermato oltre l’orario previsto;
-- `↻ 42:15`: recupero della pausa mattutina ancora disponibile;
-- `↻ -05:30`: rientro dalla pausa mattutina in ritardo di 5 minuti e 30 secondi;
-- `Zz`: fuori fascia;
-- `OFF`: promemoria disattivato e timer completamente congelato.
+viene classificato integralmente come **EXTRA festivo/ferie** e non consuma il monte ordinario settimanale.
 
-Accanto allo stato viene mostrato anche il tempo ancora necessario per completare l’obiettivo giornaliero, per esempio `52m · 6h30 da fare`. Nelle giornate lavorative straordinarie viene invece mostrato il totale `EXTRA` già accumulato.
+### Giornate lavorative straordinarie
 
-Il menu dell’icona è organizzato in gruppi separati e mantiene a portata di mano soltanto le azioni operative: **Disattiva Promemoria**, **Cosa stai facendo adesso? (CTRL + ALT + Q)**, l’eventuale avvio o ripresa della giornata, **Metti in pausa** oppure **Riprendi il lavoro adesso**, **Termina la giornata adesso**, **Mostra riepilogo** e **Impostazioni**. Durante la compensazione post chiusura compare inoltre **Concludi definitivamente adesso**. **Esci** è separato dal resto del menu.
+Una data normalmente esclusa può essere marcata come giornata lavorativa straordinaria.
 
-**Disattiva Promemoria** congela senza azzerare il timer, la fase corrente, l’attività e il progetto. La voce diventa **Riattiva promemoria**; alla riattivazione puoi scegliere **Continua da dove interrotto** per recuperare esattamente il residuo congelato oppure **Ricomincia il conteggio** per avviare un nuovo ciclo completo. Se nel frattempo è iniziata una nuova giornata, il vecchio ciclo non viene attribuito alla data nuova e viene applicato il normale avvio odierno.
+In questo caso vengono utilizzate le normali fasce mattutine e pomeridiane, ma tutto il lavoro rimane classificato come EXTRA.
 
-Dentro **Impostazioni**, nella sezione a due colonne **Azioni programma**, sono disponibili **Resetta e comincia adesso**, **Attività e tempi**, **Ferie, festività e giornate EXTRA** e **Mostra controllo**. L’avvio automatico si abilita o disabilita dalla relativa casella nelle impostazioni.
+---
 
-## Controlli manuali della giornata
-
-Le azioni operative principali sono disponibili dal menu dell’icona. La finestra **Mostra controllo** resta raggiungibile dalla sezione **Azioni programma** delle impostazioni.
+## Gestione della giornata
 
 ### Inizia a lavorare adesso
 
-Puoi avviare il lavoro prima di **Mattina inizio**, durante l’intervallo tra mattina e pomeriggio, dopo una chiusura anticipata oppure in una giornata normalmente esclusa. L’app chiede progetto e attività prima di iniziare.
+Avvia immediatamente una sessione, anche fuori dalle fasce configurate.
 
-- prima della mattina il tempo viene conteggiato come lavoro reale anticipato;
-- tra mattina e pomeriggio viene avviata anticipatamente la sessione pomeridiana;
-- dopo la chiusura il lavoro prosegue in modalità manuale finché non lo termini;
-- durante ferie, festività o giorni non attivi il tempo resta classificato come **EXTRA festivo/ferie**.
+Prima dell’avvio viene richiesta l’attività da utilizzare.
 
-### Pausa manuale
+### Termina la giornata adesso
 
-Premendo **Metti in pausa** puoi scegliere 5, 10, 15, 30 o 60 minuti, indicare liberamente una durata da 1 a 720 minuti oppure selezionare **Pausa senza scadenza**.
+Interrompe:
 
-La pausa parte nel momento della scelta, interrompe il conteggio del lavoro e viene registrata tra le pause effettive. Non viene però sommata alle ore utili dell’obiettivo giornaliero. Puoi interromperla in qualunque momento con **Riprendi il lavoro adesso**; prima di ripartire viene mostrata la normale finestra **Cosa stai facendo adesso?**.
+- lavoro;
+- ultimatum;
+- pausa;
+- attesa di rientro.
 
-### Termina e riprendi la giornata
+Il saldo viene calcolato nel momento della chiusura.
 
-**Termina la giornata adesso** ferma lavoro, ultimatum o pausa in corso e registra immediatamente il saldo maturato. Il riepilogo mostra quindi l’eventuale deficit o surplus corrente.
+La giornata può essere riaperta nello stesso giorno tramite **Riprendi la giornata adesso**.
 
-La giornata non viene bloccata definitivamente: nello stesso giorno compare **Riprendi la giornata adesso**, che riapre il saldo e ricomincia ad attribuire il tempo al progetto e all’attività scelti. Il nuovo lavoro riduce prima il deficit e soltanto l’eventuale eccedenza diventa credito.
+### Disattiva promemoria
 
-## Scorciatoie globali
+Il comando congela completamente lo stato corrente senza azzerarlo:
 
-Durante l’installazione viene registrata su GNOME/Ubuntu la scorciatoia:
+- timer;
+- fase;
+- attività;
+- progetto;
+- pausa;
+- ultimatum;
+- recupero.
 
-- **Ctrl + Alt + Q**: apre la finestra **Cosa stai facendo adesso?** e permette di continuare, riprendere o creare rapidamente un’attività.
+Alla riattivazione è possibile:
 
-La scorciatoia richiama l’istanza già aperta di WorkBreak Guard senza avviare un secondo timer. Se l’app non è in esecuzione, la avvia e inoltra la richiesta; fuori dalle fasce configurate viene mostrato il normale avviso di fuori fascia.
+- continuare dal valore congelato;
+- iniziare un nuovo ciclo completo.
 
-Lo stesso comando può essere richiamato da terminale:
+Se nel frattempo è cambiata la giornata, viene applicato il normale flusso di avvio della nuova data.
 
-```bash
-workbreak-guard --change-activity
-```
+### Reset immediato
 
-Su ambienti desktop diversi da GNOME la registrazione automatica potrebbe non essere disponibile; il comando precedente può comunque essere associato manualmente a una scorciatoia di sistema. La disinstallazione rimuove anche la scorciatoia GNOME registrata dall’app.
+Il comando **Resetta e comincia adesso** annulla la fase corrente e avvia un nuovo ciclo completo sull’attività selezionata.
+
+---
 
 ## Attività e progetti
 
-All’avvio della mattina la domanda resta **“Cosa stai facendo oggi?”**. Negli altri momenti, quando rientri da una pausa, usi il menu o premi **Ctrl + Alt + Q**, la finestra mostra **“Cosa stai facendo adesso?”** e puoi:
+La finestra **Attività e tempi** consente di consultare e modificare lo storico.
 
-- continuare l’attività corrente;
-- riprendere una delle attività usate oggi o ieri;
-- creare una nuova attività;
-- associare o cercare rapidamente un progetto già utilizzato.
+Per ogni giornata mostra:
 
-Cambiare attività non modifica il countdown della pausa: cambia soltanto la voce a cui vengono attribuiti i secondi successivi. Il pulsante **Resetta e comincia adesso**, disponibile nelle impostazioni, riporta il countdown ai minuti di lavoro configurati e lo avvia immediatamente. **Inizia a lavorare adesso** può essere usato anche prima o fuori dalle fasce, mentre **Termina la giornata adesso** e **Riprendi la giornata adesso** permettono di sospendere e riaprire il conteggio senza perdere il saldo.
+- lavoro effettivo;
+- pause effettive;
+- pause conteggiate nell’obiettivo;
+- obiettivo richiesto e tempo mancante;
+- saldo giornaliero;
+- straordinario oltre fascia;
+- EXTRA settimanale;
+- EXTRA festivo/ferie;
+- dettaglio per progetto e attività.
 
-La finestra **Attività e tempi** mostra per ogni giorno:
+È possibile:
 
-- totale del lavoro effettivo;
-- totale delle pause effettive;
-- pausa regolare conteggiata nell’obiettivo giornaliero;
-- ore richieste, ore utili registrate e tempo ancora mancante;
-- straordinario oltre la fascia oraria;
-- monte ordinario settimanale e relativo limite;
-- EXTRA oltre il limite settimanale;
-- EXTRA festivo/ferie, mostrato separatamente;
-- totale EXTRA del mese e riporto del mese precedente;
-- progetto;
-- attività;
-- tempo effettivamente impiegato.
+- aggiungere manualmente una voce;
+- modificare progetto, attività e durata;
+- eliminare una registrazione;
+- classificare il tempo non attribuito;
+- trasferire tutto o parte del tempo tra attività della stessa giornata.
 
-Da questa finestra puoi inoltre:
+Il trasferimento tra attività non modifica il totale lavorato, il saldo o gli straordinari.
 
-- aggiungere autonomamente una nuova voce con progetto, attività e durata;
-- modificare una riga con doppio clic o con **Modifica selezionata**;
-- correggere, classificare o eliminare **Tempo precedente non classificato**;
-- eliminare una voce e sottrarre automaticamente il relativo tempo dal totale;
-- aprire il riepilogo del giorno nei tab ordinati **Grafico**, **Solo testo** e **Markdown**; dal menu dell’icona la voce **Mostra riepilogo** apre direttamente quello della giornata corrente;
-- aprire **Straordinari ed EXTRA del mese**, con dettaglio giornaliero, distinzione tra oltre fascia, limite settimanale e festività/ferie, totale mensile e riporto del mese precedente.
+Lo storico viene conservato per 24 mesi.
 
-Esempio di esportazione con i tempi per task disattivati, come da impostazione predefinita:
+---
+
+## Riepiloghi
+
+Il comando **Mostra riepilogo** apre tre viste.
+
+### Grafico
+
+Mostra:
+
+- avanzamento dell’obiettivo;
+- lavoro e pause;
+- saldo;
+- distribuzione del tempo per progetto e attività.
+
+### Solo testo
+
+Presenta gli stessi dati in forma leggibile e pronta per la consultazione.
+
+### Markdown
+
+Genera un testo modificabile e copiabile, con titolo nel formato:
+
+```text
+02 dic 2026
+```
+
+La visualizzazione della durata accanto a ogni attività può essere abilitata nelle impostazioni.
+
+Esempio:
 
 ```markdown
 # 02 dic 2026
@@ -313,35 +367,299 @@ Esempio di esportazione con i tempi per task disattivati, come da impostazione p
 
 - **Totale lavoro:** 1 h 20 min
 - **Totale pause:** 10 min
-- **Pausa conteggiata nell’obiettivo giornaliero:** 5 min
+- **Pausa conteggiata nell’obiettivo:** 5 min
 - **Obiettivo giornaliero:** 1 h 25 min / 8 h
 - **Tempo mancante:** 6 h 35 min
-- **Straordinario oltre fascia del giorno:** 20 min
+- **Straordinario oltre fascia:** 20 min
 - **EXTRA totale del giorno:** 0 min
-- **EXTRA dicembre 2026:** 3 h 10 min
-- **EXTRA riportato dal mese precedente (novembre 2026):** 1 h 15 min
 ```
 
-Attivando **Mostra il tempo impiegato per ogni task nel Markdown** nelle impostazioni, le attività vengono invece mostrate nel formato `Correzione profilo utente — 1 h 20 min`. Questa opzione riguarda soltanto il tab Markdown: il tab Grafico mostra sempre le durate, perché sono necessarie per leggere correttamente le barre.
+---
 
-## Ferie, festività e giornate lavorative EXTRA
+## Ferie e festività
 
-Apri **Ferie, festività e giornate EXTRA** dalla sezione **Azioni programma** di **Impostazioni**.
+WorkBreak Guard calcola automaticamente le festività nazionali italiane, comprese quelle mobili come il lunedì dell’Angelo.
 
-La finestra permette di:
+Dal 2026 viene considerato anche il 4 ottobre.
 
-- aggiungere una singola giornata di ferie o una festività mancante;
-- aggiungere un intervallo, per esempio dal 10 al 21 agosto;
-- aggiungere una **Giornata lavorativa straordinaria** che riattiva le fasce configurate anche se quella data è festiva, di ferie o normalmente esclusa;
-- assegnare una descrizione;
-- scegliere se la voce vale una sola volta oppure si ripete ogni anno;
-- modificare ed eliminare le date inserite.
+È inoltre possibile abilitare separatamente:
 
-Le festività nazionali sono calcolate in base all’anno, quindi il lunedì dell’Angelo cambia automaticamente. Le ricorrenze fisse e i patroni selezionati vengono riconosciuti anche negli anni successivi.
+- patrono di Este, 23 settembre;
+- patrono di Firenze, 24 giugno.
 
-Quando una giornata normalmente esclusa viene resa lavorativa, il timer usa le normali fasce mattina/pomeriggio ma tutte le ore effettivamente lavorate vengono indicate come **EXTRA festivo/ferie**. Queste ore non consumano il limite ordinario settimanale e vengono mostrate separatamente nei riepiloghi.
+La finestra **Ferie, festività e giornate EXTRA** permette di aggiungere:
 
-## Comandi utili
+- una singola data;
+- un intervallo;
+- una ricorrenza annuale;
+- una giornata lavorativa straordinaria;
+- una descrizione personalizzata.
+
+Le date inserite possono essere modificate o eliminate.
+
+---
+
+## Persistenza dello stato
+
+Se il programma viene chiuso e riaperto nella stessa giornata, vengono ripristinati:
+
+- fase corrente;
+- tempo residuo;
+- progetto e attività;
+- ultimatum;
+- pausa normale o manuale;
+- pausa senza scadenza;
+- giornata sospesa;
+- recupero post chiusura.
+
+Il tempo trascorso mentre il programma non è in esecuzione non viene conteggiato.
+
+Se alla riapertura è cambiata la fascia o la giornata, viene applicato il normale reset previsto dalla configurazione.
+
+---
+
+## Backup
+
+WorkBreak Guard supporta due destinazioni indipendenti:
+
+1. backup JSON locale;
+2. seconda copia opzionale su Google Drive o in una cartella sincronizzata.
+
+Il backup locale è attivo per impostazione predefinita.
+
+### Cartella predefinita
+
+```text
+~/.config/workbreak-guard/backups/
+```
+
+### Contenuto
+
+Ogni backup contiene:
+
+- impostazioni;
+- storico delle attività;
+- stato temporaneo del timer, quando disponibile;
+- versione e data del formato di backup.
+
+Il nome del file segue questo formato:
+
+```text
+workbreak-guard-backup-2026-07-17_183000.json
+```
+
+### Frequenza
+
+È possibile scegliere:
+
+- backup automatico disattivato;
+- backup giornaliero alla prima apertura utile;
+- backup mensile alla prima apertura utile.
+
+Il comando **Esegui backup adesso** genera un unico file e tenta di copiarlo in tutte le destinazioni abilitate.
+
+Il fallimento della copia remota non invalida il backup locale.
+
+### Google Drive
+
+Il programma non richiede un’integrazione Google proprietaria. Utilizza una cartella Drive già disponibile nel file manager oppure una normale cartella locale sincronizzata con un servizio esterno.
+
+Procedura:
+
+1. selezionare **Configura backup su Google Drive**;
+2. scegliere il Drive già collegato da **Altre posizioni**;
+3. selezionare la cartella di destinazione;
+4. attendere la verifica di scrittura.
+
+Il comando **Gestisci account Google** apre le impostazioni Account online di GNOME ed è necessario soltanto per aggiungere o correggere un account.
+
+### Ripristino
+
+**Ripristina da backup** permette di selezionare un file JSON locale o raggiungibile tramite Drive.
+
+Prima del ripristino viene creata una copia di sicurezza in:
+
+```text
+~/.config/workbreak-guard/restore-safety/
+```
+
+Dopo l’operazione il timer rimane congelato per evitare che i dati ripristinati vengano sovrascritti prima del riavvio.
+
+---
+
+## Installazione
+
+### Dipendenze
+
+```bash
+sudo apt-get install -y \
+  python3-gi \
+  gir1.2-gtk-3.0 \
+  pulseaudio-utils \
+  gir1.2-ayatanaappindicator3-0.1 \
+  gnome-shell-extension-appindicator
+```
+
+### Installazione del programma
+
+```bash
+unzip workbreak-guard.zip
+cd workbreak-guard
+./install.sh
+```
+
+Avvio:
+
+```bash
+workbreak-guard
+```
+
+L’installazione abilita automaticamente l’avvio all’accesso.
+
+Se una versione è già in esecuzione, lo script:
+
+1. chiude l’istanza corrente;
+2. sostituisce i file;
+3. riavvia il programma soltanto se era già aperto.
+
+Per non configurare l’avvio automatico:
+
+```bash
+./install.sh --no-autostart
+```
+
+---
+
+## Configurazione
+
+Aprire **Impostazioni** dal menu dell’area di notifica o dalla finestra di controllo.
+
+Le principali opzioni configurabili sono:
+
+- fasce mattutina e pomeridiana;
+- giorni lavorativi;
+- durata dei cicli;
+- durata predefinita delle pause;
+- plafond giornaliero delle pause;
+- limite della singola pausa;
+- obiettivo massimo giornaliero;
+- gestione del saldo mensile;
+- festività e patroni;
+- ferie e giornate EXTRA;
+- intervallo degli avvisi oltre fascia;
+- suoni e volume;
+- avvio automatico;
+- formato dei riepiloghi;
+- backup locale e remoto.
+
+Il salvataggio delle impostazioni non interrompe né azzera il timer.
+
+Le opzioni strutturali contrassegnate con **↻** vengono applicate al successivo avvio, tra cui:
+
+- cicli;
+- obiettivo giornaliero;
+- fasce;
+- giorni;
+- festività;
+- quote delle pause;
+- chiusura mensile.
+
+Le impostazioni audio, l’avvio automatico e il formato Markdown possono essere applicati immediatamente.
+
+---
+
+## File dati
+
+Impostazioni:
+
+```text
+~/.config/workbreak-guard/settings.json
+```
+
+Storico giornaliero, progetti e attività:
+
+```text
+~/.config/workbreak-guard/activity-log.json
+```
+
+Stato temporaneo del timer:
+
+```text
+~/.config/workbreak-guard/runtime-state.json
+```
+
+Backup:
+
+```text
+~/.config/workbreak-guard/backups/
+```
+
+Copie di sicurezza create prima di un ripristino:
+
+```text
+~/.config/workbreak-guard/restore-safety/
+```
+
+Configurazione autostart:
+
+```text
+~/.config/autostart/workbreak-guard.desktop
+```
+
+---
+
+## Area di notifica
+
+Quando AppIndicator supporta le etichette, accanto all’icona viene mostrato uno stato sintetico.
+
+| Stato | Significato |
+|---|---|
+| `52m` | tempo rimanente nel ciclo di lavoro |
+| `! 05:00` | ultimatum prima della pausa |
+| `☕ 04:30` | pausa in corso |
+| `☕ ∞` | pausa manuale senza scadenza |
+| `Rientro -00:30` | pausa terminata, rientro non ancora confermato |
+| `START` | attesa dell’avvio della fascia |
+| `FINE` | giornata chiusa ma ancora riapribile |
+| `Fine?` | conferma richiesta alla fine della fascia |
+| `↥ 01:00` | compensazione del saldo negativo |
+| `+ 12:30` | lavoro oltre l’orario previsto |
+| `Zz` | fuori fascia |
+| `OFF` | promemoria disattivati e stato congelato |
+
+Quando disponibile, viene mostrato anche il tempo necessario per completare l’obiettivo:
+
+```text
+52m · 6h30 da fare
+```
+
+Nei giorni classificati interamente come EXTRA viene mostrato il totale accumulato.
+
+---
+
+## Scorciatoia globale
+
+L’installazione registra su GNOME:
+
+```text
+Ctrl + Alt + Q
+```
+
+La scorciatoia apre direttamente la selezione dell’attività e comunica con l’istanza già in esecuzione.
+
+Il comando equivalente è:
+
+```bash
+workbreak-guard --change-activity
+```
+
+Su desktop diversi da GNOME può essere associato manualmente a una scorciatoia di sistema.
+
+---
+
+## Comandi disponibili
+
+Gestione dell’avvio automatico:
 
 ```bash
 workbreak-guard --enable-autostart
@@ -349,28 +667,54 @@ workbreak-guard --disable-autostart
 workbreak-guard --status-autostart
 ```
 
-Il file autostart viene gestito qui:
+Cambio rapido dell’attività:
 
-```text
-~/.config/autostart/workbreak-guard.desktop
+```bash
+workbreak-guard --change-activity
 ```
 
+---
+
+## Compatibilità Wayland e GNOME
+
+Su Wayland il compositor può limitare il posizionamento assoluto delle finestre.
+
+WorkBreak Guard tenta di mostrare gli avvisi:
+
+- sul monitor in cui si trova il puntatore;
+- in alto a destra;
+- senza sottrarre il focus alla finestra corrente.
+
+Il compositor può comunque scegliere una posizione differente.
+
+La visualizzazione del testo accanto all’icona dipende dal supporto AppIndicator del pannello. Quando il pannello mostra soltanto l’icona, lo stato completo rimane disponibile nel menu e nella finestra di controllo.
+
+---
+
 ## Disinstallazione
+
+Dalla cartella del programma:
 
 ```bash
 ./uninstall.sh
 ```
 
-## Note Wayland/GNOME
+La procedura rimuove anche l’avvio automatico e la scorciatoia GNOME registrata dall’applicazione.
 
-Su Wayland alcuni compositor possono limitare il posizionamento assoluto delle finestre. L’app prova a mostrare gli avvisi rapidi in alto a destra sul monitor in cui si trova il puntatore e senza focus automatico, ma il compositor può scegliere una posizione differente.
+---
 
-La preview testuale accanto all’icona usa la funzione label di AppIndicator/Ayatana. Alcuni pannelli GNOME possono mostrare solo l’icona e nascondere il testo: in quel caso lo stato completo resta visibile nel menu della tray e nella finestra di controllo.
+## Licenza
 
-## Licenza, autore e contatti
+Copyright © 2026 **Giuseppe Mazzullo**  
+Contatto: **info@animalsina.work**
 
-Copyright © 2026 **Giuseppe Mazzullo** — **info@animalsina.work**.
+WorkBreak Guard è distribuito secondo i termini della **PolyForm Noncommercial License 1.0.0**.
 
-WorkBreak Guard è distribuito con **PolyForm Noncommercial License 1.0.0**. L’uso, la modifica e la redistribuzione gratuita sono consentiti per finalità non commerciali nel rispetto del file [`LICENSE`](LICENSE) e mantenendo gli avvisi di copyright. Qualsiasi utilizzo commerciale richiede un’autorizzazione scritta separata dell’autore.
+Sono consentiti uso, modifica e redistribuzione per finalità non commerciali, nel rispetto del file [`LICENSE`](LICENSE) e degli avvisi di copyright.
 
-I riferimenti dell’autore e la firma sono disponibili anche in [`AUTHORS.md`](AUTHORS.md) e [`NOTICE`](NOTICE).
+Qualsiasi utilizzo commerciale richiede un’autorizzazione scritta separata dell’autore.
+
+Ulteriori riferimenti sono disponibili in:
+
+- [`AUTHORS.md`](AUTHORS.md)
+- [`NOTICE`](NOTICE)
