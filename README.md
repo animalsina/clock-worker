@@ -4,7 +4,6 @@ WorkBreak Guard è un’applicazione per Ubuntu e ambienti desktop Linux, proget
 
 L’applicazione funziona tramite area di notifica AppIndicator, con una finestra di controllo alternativa quando il pannello non supporta correttamente la tray.
 
-<<<<<<< HEAD
 - Rileva su Wayland le chiamate Slack accettate tramite il flusso microfono PipeWire/PulseAudio, propone un timer dedicato, applica una retention configurabile alla chiusura e chiede una descrizione finale. Quando Slack include il chiamante nella notifica desktop, correla il nome alla chiamata e crea attività come **Chiamata Slack con Mario Rossi — argomento**. Dal menu dell’icona è disponibile anche una modalità chiamata manuale per telefono, Meet o altre occasioni.
 
 - Gestisce separatamente la fascia del mattino e quella del pomeriggio.
@@ -66,9 +65,6 @@ L’applicazione funziona tramite area di notifica AppIndicator, con una finestr
 - Le finestre di avviso rapide vengono mostrate in alto a destra sul monitor in cui si trova il puntatore, senza rubare il focus alla tastiera. I pulsanti restano disabilitati per i primi 800 ms per evitare selezioni involontarie causate dal clic già in corso.
 - Alla scadenza dei timer permette di scegliere tra nessun suono, beep morbido, doppio beep o campanello; nelle impostazioni è disponibile anche il pulsante **Prova**. Durante la pausa può continuare a emettere beep lievi periodici, configurabili e disattivabili.
 - Aggiunge una voce nella tray/barra se AppIndicator è disponibile; altrimenti usa una piccola finestra di controllo.
-=======
-## Funzionalità principali
->>>>>>> fd9e63a066e7a5249316d6588de4d8b4a502f918
 
 - gestione separata delle fasce lavorative mattutina e pomeridiana;
 - cicli configurabili di lavoro e pausa;
@@ -82,7 +78,6 @@ L’applicazione funziona tramite area di notifica AppIndicator, con una finestr
 - backup locale e seconda copia opzionale su Google Drive;
 - scorciatoia globale per cambiare rapidamente attività.
 
-<<<<<<< HEAD
 ```bash
 unzip workbreak-guard.zip
 cd workbreak-guard
@@ -95,17 +90,9 @@ L’installazione abilita l’avvio automatico, chiude in modo controllato l’e
 Il launcher usa esplicitamente `/usr/bin/python3` in modalità isolata e rimuove le variabili ereditate da Snap, IDE e AppImage. In questo modo non vengono caricate per errore librerie come `/snap/core20/.../libpthread.so.0`, incompatibili con la glibc del sistema. Durante l’installazione vengono inoltre riparate le eventuali vecchie scorciatoie di WorkBreak Guard presenti in **Desktop/Scrivania**: non cercano più i file del progetto accanto al collegamento, ma aprono sempre l’installazione stabile in `~/.local/bin/workbreak-guard`.
 
 Per installare senza autostart, ma aprendo comunque subito il programma:
-=======
----
-
-## Modello di funzionamento
-
-### Fasce lavorative
->>>>>>> fd9e63a066e7a5249316d6588de4d8b4a502f918
 
 È possibile configurare:
 
-<<<<<<< HEAD
 Per installare senza aprire il programma al termine:
 
 ```bash
@@ -153,13 +140,6 @@ Puoi modificare:
 - ripristino da un backup locale o remoto con conferma e creazione preventiva di una copia locale di sicurezza;
 - rilevamento chiamate Slack disattivabile, con intervallo di controllo, retention di chiusura, progetto e nome attività configurabili;
 - recupero facoltativo del nome chiamante dalle notifiche desktop, con validità configurabile da 15 a 600 secondi.
-=======
-- inizio e fine della fascia mattutina;
-- inizio e fine della fascia pomeridiana;
-- giorni attivi;
-- obiettivo massimo giornaliero;
-- durata dei cicli di lavoro e delle pause.
->>>>>>> fd9e63a066e7a5249316d6588de4d8b4a502f918
 
 Il timer parte automaticamente soltanto nei giorni e nelle fasce configurate. È comunque possibile avviare manualmente una sessione:
 
@@ -185,7 +165,6 @@ Progetto + Attività
 - creare una nuova attività;
 - cercare un progetto già utilizzato.
 
-<<<<<<< HEAD
 1. collega l’account in **Account online** di GNOME, se non è già presente;
 2. nell’account Google verifica che il servizio **File** sia abilitato;
 3. premi **Configura backup su Google Drive**;
@@ -218,77 +197,6 @@ Ogni file contiene in forma leggibile:
 La frequenza condivisa può essere **Disattivata**, **Ogni giorno all’apertura mattutina** oppure **Ogni mese alla prima apertura**. Per il giornaliero viene usato l’orario **Mattina inizio**; se il programma viene aperto più tardi, il backup parte alla prima apertura utile della giornata. Ogni destinazione conserva il proprio stato: se la copia locale riesce e Drive fallisce, al successivo avvio Drive può essere ritentato senza rigenerare inutilmente la copia locale già completata.
 
 **Ripristina da file** apre un JSON locale. **Ripristina dal file su Google Drive** recupera direttamente `workbreak-guard-backup.json` dall’account configurato, senza aprire un selettore di cartelle. Prima di sostituire i dati, l’app crea automaticamente una copia locale in:
-=======
-Ogni secondo di lavoro viene attribuito all’attività selezionata.
-
-### Fine della fascia
-
-Alla fine della fascia mattutina o pomeridiana il conteggio non viene interrotto automaticamente.
-
-L’applicazione chiede se il lavoro sta continuando. In caso di conferma:
-
-- il tempo successivo viene registrato come lavoro effettivo;
-- l’avviso viene ripetuto secondo l’intervallo configurato;
-- il lavoro oltre la fascia contribuisce a compensare eventuali ore mancanti.
-
-Se l’avviso non riceve risposta entro 20 minuti, il tempo viene chiuso all’ultimo momento confermato, evitando di registrare lavoro non effettivamente svolto.
-
----
-
-## Cicli di lavoro e pause
-
-### Scadenza del ciclo
-
-Quando termina un ciclo di lavoro è possibile scegliere:
-
-- l’ultimatum predefinito;
-- 5 minuti;
-- 10 minuti;
-- avvio immediato della pausa;
-- prosecuzione del lavoro senza registrare alcuna pausa.
-
-Il lavoro continua a essere conteggiato fino alla conferma effettiva dell’inizio della pausa.
-
-### Durata della pausa
-
-Per ogni pausa ciclica è possibile scegliere:
-
-- 5 minuti;
-- 10 minuti;
-- 15 minuti;
-- una durata personalizzata fino a 12 ore.
-
-Durante la pausa il countdown viene mostrato nell’area di notifica.
-
-Al termine viene richiesta la nuova attività. Il tempo trascorso tra la fine prevista della pausa e la conferma del rientro rimane registrato come pausa effettiva.
-
-### Pause manuali
-
-Dal comando **Metti in pausa** è possibile avviare:
-
-- una pausa da 5, 10, 15, 30 o 60 minuti;
-- una pausa personalizzata da 1 a 720 minuti;
-- una pausa senza scadenza.
-
-Le pause manuali interrompono il lavoro e vengono registrate nello storico, ma non vengono considerate tempo utile per il raggiungimento dell’obiettivo giornaliero.
-
-Possono essere interrotte in qualsiasi momento con **Riprendi il lavoro adesso**.
-
----
-
-## Abbuono delle pause regolari
-
-Le pause cicliche possono contribuire al completamento dell’obiettivo giornaliero entro un plafond configurabile.
-
-Il valore predefinito è composto da:
-
-```text
-10 minuti per ogni blocco iniziato di 2 ore lavorate
-+ 20 minuti di abbuono extra giornaliero
-```
-
-Con una giornata da 8 ore:
->>>>>>> fd9e63a066e7a5249316d6588de4d8b4a502f918
 
 ```text
 Quota regolare:             10 min × 4 blocchi = 40 min
@@ -401,7 +309,6 @@ Il tempo che supera questo limite viene classificato come **EXTRA settimanale**.
 
 ### EXTRA festivo/ferie
 
-<<<<<<< HEAD
 
 ### Chiamate Slack su Wayland
 
@@ -414,9 +321,6 @@ Dal menu dell’icona puoi scegliere **Avvia modalità chiamata manuale**. Duran
 Gli identificativi tecnici temporanei `__wbg_slack_call_*__` vengono ora riparati automaticamente all’avvio. Possono rimanere nello storico soltanto quando una versione precedente viene interrotta prima del consolidamento della chiamata.
 
 ## Voci nella barra
-=======
-Il lavoro svolto durante:
->>>>>>> fd9e63a066e7a5249316d6588de4d8b4a502f918
 
 - festività;
 - ferie;
