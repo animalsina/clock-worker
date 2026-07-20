@@ -1,0 +1,231 @@
+--- /mnt/data/workbreak_original/workbreak_guard.py	2026-07-20 10:16:18.000000000 +0000
++++ /mnt/data/workbreak_inspect/workbreak_guard.py	2026-07-20 08:46:33.756813088 +0000
+@@ -5204,36 +5204,118 @@
+             and "/gvfs/google-drive:" in normalized
+         )
+ 
++    @staticmethod
++    def _variant_value(value: object, default: object = "") -> object:
++        try:
++            return value.unpack()  # type: ignore[attr-defined]
++        except Exception:
++            return default if value is None else value
++
++    def _google_drive_goa_accounts(self) -> list[tuple[str, str]]:
++        """Legge gli account con servizio File direttamente da GNOME Online Accounts."""
++        accounts: list[tuple[str, str]] = []
++        try:
++            connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
++            result = connection.call_sync(
++                "org.gnome.OnlineAccounts",
++                "/org/gnome/OnlineAccounts",
++                "org.freedesktop.DBus.ObjectManager",
++                "GetManagedObjects",
++                None,
++                GLib.VariantType.new("(a{oa{sa{sv}}})"),
++                Gio.DBusCallFlags.NONE,
++                5000,
++                None,
++            )
++            managed_objects = result.unpack()[0]
++            for interfaces in managed_objects.values():
++                account = interfaces.get("org.gnome.OnlineAccounts.Account")
++                files = interfaces.get("org.gnome.OnlineAccounts.Files")
++                if not account or not files:
++                    continue
++                provider = str(
++                    self._variant_value(account.get("ProviderType"), "") or ""
++                ).lower()
++                files_disabled = bool(
++                    self._variant_value(account.get("FilesDisabled"), False)
++                )
++                uri = str(self._variant_value(files.get("Uri"), "") or "")
++                if provider != "google" or files_disabled or not self._is_google_drive_uri(uri):
++                    continue
++                name = str(
++                    self._variant_value(account.get("PresentationIdentity"), "")
++                    or self._variant_value(account.get("Identity"), "")
++                    or "Google Drive"
++                )
++                accounts.append((name, uri))
++        except Exception:
++            # GNOME Online Accounts può non essere disponibile su desktop non GNOME.
++            pass
++        return accounts
++
+     def _google_drive_mounts(self) -> list[tuple[str, str]]:
+-        mounts: list[tuple[str, str]] = []
++        accounts: list[tuple[str, str]] = []
+         seen: set[str] = set()
++
++        def add_account(name: str, uri: str) -> None:
++            normalized = str(uri or "").strip()
++            if not normalized or normalized in seen:
++                return
++            seen.add(normalized)
++            accounts.append((str(name or "Google Drive"), normalized))
++
++        # Prima recupera gli account configurati, anche se Nautilus non li ha
++        # ancora montati nella sessione corrente.
++        for name, uri in self._google_drive_goa_accounts():
++            add_account(name, uri)
++
+         try:
+             monitor = Gio.VolumeMonitor.get()
+             for mount in monitor.get_mounts():
+                 root = mount.get_root()
+                 uri = root.get_uri() if root else ""
+                 name = str(mount.get_name() or "Google Drive")
+-                if self._is_google_drive_uri(uri) and uri not in seen:
+-                    seen.add(uri)
+-                    mounts.append((name, uri))
++                if self._is_google_drive_uri(uri):
++                    add_account(name, uri)
+         except Exception:
+             pass
+ 
+-        # Alcune versioni di GVFS non espongono subito il mount al VolumeMonitor,
+-        # pur rendendolo già disponibile nel filesystem della sessione utente.
++        # Fallback per versioni di GVFS che espongono solo il mount FUSE.
+         runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+         gvfs_dir = Path(runtime_dir) / "gvfs"
+         try:
+             for item in gvfs_dir.iterdir():
+                 if not item.name.startswith("google-drive:"):
+                     continue
+-                uri = item.resolve().as_uri()
+-                if uri not in seen:
+-                    seen.add(uri)
+-                    mounts.append(("Google Drive", uri))
++                add_account("Google Drive", item.resolve().as_uri())
+         except Exception:
+             pass
+-        return mounts
++        return accounts
++
++    @staticmethod
++    def _mount_google_drive_uri(account_uri: str) -> str:
++        """Tenta il montaggio tramite GIO e restituisce l'eventuale dettaglio."""
++        gio_command = shutil.which("gio")
++        if not gio_command:
++            return "Comando gio non disponibile (pacchetto libglib2.0-bin)."
++        try:
++            result = subprocess.run(
++                [gio_command, "mount", account_uri],
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,
++                text=True,
++                timeout=45,
++                check=False,
++            )
++        except subprocess.TimeoutExpired:
++            return "Il montaggio di Google Drive non ha risposto entro 45 secondi."
++        except Exception as exc:
++            return str(exc)
++
++        detail = (result.stderr or result.stdout or "").strip()
++        if result.returncode == 0 or "already mounted" in detail.lower():
++            return ""
++        return detail or f"gio mount terminato con codice {result.returncode}."
+ 
+     def _show_backup_message(
+         self,
+@@ -5290,10 +5372,10 @@
+                 parent,
+                 "Google Drive non disponibile",
+                 (
+-                    "Non vedo ancora alcun account Google Drive montato nella "
+-                    "sessione. Apri File → Altre posizioni e apri il Google Drive "
+-                    "già configurato, poi riprova. Non devi scegliere una cartella "
+-                    "e non devi aggiungere di nuovo l’account."
++                    "Non risulta alcun account Google con il servizio File attivo "
++                    "nella sessione GNOME. Apri Account online, seleziona l’account "
++                    "Google e verifica che File sia abilitato. Non aggiungere un "
++                    "duplicato dell’account già presente."
+                 ),
+                 error=True,
+             )
+@@ -5349,27 +5431,47 @@
+         account_name: str,
+         account_uri: str,
+     ) -> None:
++        root = Gio.File.new_for_uri(account_uri)
++        first_error = ""
+         try:
+-            root = Gio.File.new_for_uri(account_uri)
+             info = root.query_info(
+                 "standard::display-name,standard::type",
+                 Gio.FileQueryInfoFlags.NONE,
+                 None,
+             )
+-            if info.get_file_type() != Gio.FileType.DIRECTORY:
+-                raise ValueError("La radice del Drive non è accessibile")
+-            display_name = str(info.get_display_name() or account_name or "Google Drive")
+         except Exception as exc:
++            first_error = str(exc)
++            mount_error = self._mount_google_drive_uri(account_uri)
++            try:
++                info = root.query_info(
++                    "standard::display-name,standard::type",
++                    Gio.FileQueryInfoFlags.NONE,
++                    None,
++                )
++            except Exception as retry_exc:
++                details = mount_error or str(retry_exc) or first_error
++                self._show_backup_message(
++                    parent,
++                    "Account Google Drive non accessibile",
++                    (
++                        "L’account è stato trovato, ma il servizio File non può "
++                        "essere montato. Verifica in Account online che File sia "
++                        "attivo e che l’account non richieda nuovamente l’accesso. "
++                        f"Dettaglio: {details}"
++                    ),
++                    error=True,
++                )
++                return
++
++        if info.get_file_type() != Gio.FileType.DIRECTORY:
+             self._show_backup_message(
+                 parent,
+                 "Account Google Drive non accessibile",
+-                (
+-                    "Apri prima il Drive da File → Altre posizioni e riprova. "
+-                    f"Dettaglio: {exc}"
+-                ),
++                "La destinazione restituita da GNOME non è una cartella accessibile.",
+                 error=True,
+             )
+             return
++        display_name = str(info.get_display_name() or account_name or "Google Drive")
+ 
+         self._update_persisted_backup_settings(
+             google_drive_backup_folder_uri=account_uri,
+--- /mnt/data/workbreak_original/install.sh	2026-07-20 10:16:18.000000000 +0000
++++ /mnt/data/workbreak_inspect/install.sh	2026-07-20 08:46:33.757117612 +0000
+@@ -164,7 +164,7 @@
+   echo "Dipendenze principali consigliate su Ubuntu:"
+   echo "  sudo apt-get install -y python3-gi gir1.2-gtk-3.0 pulseaudio-utils pipewire-bin dbus gir1.2-ayatanaappindicator3-0.1 gnome-shell-extension-appindicator"
+   echo "Integrazione Google Drive opzionale tramite GNOME:"
+-  echo "  sudo apt-get install -y gnome-online-accounts gvfs-backends"
++  echo "  sudo apt-get install -y gnome-online-accounts gvfs-backends libglib2.0-bin"
+ fi
+ 
+ echo "Installato: $APP_NAME"
+--- /mnt/data/workbreak_original/README.md	2026-07-20 10:16:18.000000000 +0000
++++ /mnt/data/workbreak_inspect/README.md	2026-07-20 08:46:33.757651475 +0000
+@@ -149,10 +149,12 @@
+ Per configurare Google Drive:
+ 
+ 1. collega l’account in **Account online** di GNOME, se non è già presente;
+-2. apri una volta **File → Altre posizioni → Google Drive**, così il Drive viene montato nella sessione;
++2. nell’account Google verifica che il servizio **File** sia abilitato;
+ 3. premi **Configura backup su Google Drive**;
+ 4. scegli soltanto l’account, non una cartella;
+-5. il programma crea immediatamente una copia di verifica.
++5. il programma rileva l’URI esposto da GNOME, monta Drive se necessario e crea una copia di verifica.
++
++Non è più necessario aprire manualmente Google Drive in **File → Altre posizioni** prima della configurazione.
+ 
+ Su Google Drive viene mantenuto esclusivamente questo file, sempre sovrascritto con la versione più recente:
+ 

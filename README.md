@@ -4,6 +4,8 @@ Promemoria pause per Ubuntu/Wayland, pensato per chi lavora molte ore al PC.
 
 ## Cosa fa
 
+- Rileva su Wayland le chiamate Slack accettate tramite il flusso microfono PipeWire/PulseAudio, propone un timer dedicato, applica una retention configurabile alla chiusura e chiede una descrizione finale. Quando Slack include il chiamante nella notifica desktop, correla il nome alla chiamata e crea attività come **Chiamata Slack con Mario Rossi — argomento**. Dal menu dell’icona è disponibile anche una modalità chiamata manuale per telefono, Meet o altre occasioni.
+
 - Gestisce separatamente la fascia del mattino e quella del pomeriggio.
 - All’ingresso in **Mattina inizio** e **Pomeriggio inizio** azzera il ciclo, ma applica sempre un limite forzato all’orario di fine della fascia: il timer parte dal valore minore tra i minuti configurati e il tempo realmente rimasto. Per esempio, alle 12:38 con **Mattina fine** alle 13:00 mostra 22 minuti, non 60.
 - Non avvia automaticamente il conteggio: mostra prima la richiesta **“Possiamo iniziare la mattina/pomeriggio?”**.
@@ -69,17 +71,24 @@ Promemoria pause per Ubuntu/Wayland, pensato per chi lavora molte ore al PC.
 ```bash
 unzip workbreak-guard.zip
 cd workbreak-guard
-sudo apt-get install -y python3-gi gir1.2-gtk-3.0 pulseaudio-utils gir1.2-ayatanaappindicator3-0.1 gnome-shell-extension-appindicator
+sudo apt-get install -y python3-gi gir1.2-gtk-3.0 pulseaudio-utils pipewire-bin dbus gir1.2-ayatanaappindicator3-0.1 gnome-shell-extension-appindicator
 ./install.sh
-workbreak-guard
 ```
 
-L’installazione abilita l’avvio automatico. Se una versione installata è già in esecuzione, `install.sh` la chiude prima di sostituire i file e avvia automaticamente la nuova versione. Se il programma era chiuso, al termine dell’installazione resta chiuso.
+L’installazione abilita l’avvio automatico, chiude in modo controllato l’eventuale versione precedente e avvia sempre la versione appena installata. Il riavvio usa il PID salvato dall’app e verifica che il nuovo processo sia realmente partito; in caso contrario indica il file di log `~/.config/workbreak-guard/startup.log`.
 
-Per installare senza avvio automatico:
+Il launcher usa esplicitamente `/usr/bin/python3` in modalità isolata e rimuove le variabili ereditate da Snap, IDE e AppImage. In questo modo non vengono caricate per errore librerie come `/snap/core20/.../libpthread.so.0`, incompatibili con la glibc del sistema. Durante l’installazione vengono inoltre riparate le eventuali vecchie scorciatoie di WorkBreak Guard presenti in **Desktop/Scrivania**: non cercano più i file del progetto accanto al collegamento, ma aprono sempre l’installazione stabile in `~/.local/bin/workbreak-guard`.
+
+Per installare senza autostart, ma aprendo comunque subito il programma:
 
 ```bash
 ./install.sh --no-autostart
+```
+
+Per installare senza aprire il programma al termine:
+
+```bash
+./install.sh --no-start
 ```
 
 Su Ubuntu/GNOME la tray può dipendere dall’estensione AppIndicator. Se non compare, l’app resta utilizzabile tramite la finestra di controllo.
@@ -117,10 +126,12 @@ Puoi modificare:
 - numero beep e distanza in secondi;
 - inclusione facoltativa del tempo impiegato accanto a ogni task nel riepilogo Markdown, disattivata per impostazione predefinita;
 - backup JSON locale indipendente da Google, attivo per impostazione predefinita;
-- seconda copia opzionale su Google Drive o in una cartella locale già sincronizzata con Drive;
+- copia opzionale su Google Drive gestita come singolo file remoto fisso, senza selezionare o sincronizzare cartelle arbitrarie;
 - backup manuale unico verso tutte le destinazioni configurate;
 - backup automatico giornaliero all’orario di apertura mattutina oppure mensile alla prima apertura utile;
-- ripristino da un backup locale o remoto con conferma e creazione preventiva di una copia locale di sicurezza.
+- ripristino da un backup locale o remoto con conferma e creazione preventiva di una copia locale di sicurezza;
+- rilevamento chiamate Slack disattivabile, con intervallo di controllo, retention di chiusura, progetto e nome attività configurabili;
+- recupero facoltativo del nome chiamante dalle notifiche desktop, con validità configurabile da 15 a 600 secondi.
 
 ### Backup locale e Google Drive
 
@@ -139,19 +150,27 @@ Puoi cambiarla con **Scegli cartella locale** oppure disattivare la copia locale
 
 Per configurare Google Drive:
 
-1. premi **Configura backup su Google Drive**;
-2. nel selettore apri **Altre posizioni** e scegli il Google Drive già collegato;
-3. non è necessario aggiungere nuovamente un account esistente;
-4. in alternativa puoi scegliere una normale cartella locale già sincronizzata con Drive, per esempio tramite un mount esterno;
-5. il programma crea subito una copia di verifica e mostra **Tutto ok, configurato** oppure il problema rilevato.
+1. collega l’account in **Account online** di GNOME, se non è già presente;
+2. nell’account Google verifica che il servizio **File** sia abilitato;
+3. premi **Configura backup su Google Drive**;
+4. scegli soltanto l’account, non una cartella;
+5. il programma rileva l’URI esposto da GNOME, monta Drive se necessario e crea una copia di verifica.
 
-**Gestisci account Google** apre Account online di GNOME solo quando vuoi realmente aggiungere, rimuovere o correggere un account. Non viene più aperto automaticamente dal flusso di configurazione, evitando il tentativo di duplicare un account già presente.
+Non è più necessario aprire manualmente Google Drive in **File → Altre posizioni** prima della configurazione.
 
-I backup sono file autonomi con nome simile a:
+Su Google Drive viene mantenuto esclusivamente questo file, sempre sovrascritto con la versione più recente:
 
 ```text
-workbreak-guard-backup-2026-07-17_183000.json
+workbreak-guard-backup.json
 ```
+
+Non viene sincronizzata alcuna cartella e non vengono creati backup remoti con timestamp. Il trasferimento remoto avviene tramite uno stream GIO compatibile con GVfs: il vecchio file viene rimosso e viene creato direttamente il nuovo JSON, senza usare copie o sostituzioni atomiche non supportate dal mount Google Drive. Lo storico locale continua invece a usare file autonomi con nome simile a:
+
+```text
+workbreak-guard-backup-2026-07-20_103000.json
+```
+
+**Gestisci account Google** apre Account online di GNOME solo per aggiungere, rimuovere o correggere un account. Se una versione precedente aveva salvato una cartella arbitraria, il programma richiede una sola riconfigurazione per passare alla modalità a file remoto unico.
 
 Ogni file contiene in forma leggibile:
 
@@ -162,7 +181,7 @@ Ogni file contiene in forma leggibile:
 
 La frequenza condivisa può essere **Disattivata**, **Ogni giorno all’apertura mattutina** oppure **Ogni mese alla prima apertura**. Per il giornaliero viene usato l’orario **Mattina inizio**; se il programma viene aperto più tardi, il backup parte alla prima apertura utile della giornata. Ogni destinazione conserva il proprio stato: se la copia locale riesce e Drive fallisce, al successivo avvio Drive può essere ritentato senza rigenerare inutilmente la copia locale già completata.
 
-**Ripristina da backup** apre un selettore che permette di scegliere sia un JSON locale sia un file raggiungibile tramite Google Drive. Prima di sostituire i dati, l’app crea automaticamente una copia locale in:
+**Ripristina da file** apre un JSON locale. **Ripristina dal file su Google Drive** recupera direttamente `workbreak-guard-backup.json` dall’account configurato, senza aprire un selettore di cartelle. Prima di sostituire i dati, l’app crea automaticamente una copia locale in:
 
 ```text
 ~/.config/workbreak-guard/restore-safety/
@@ -197,6 +216,17 @@ Lo stato temporaneo necessario a riprendere il timer dopo la chiusura è salvato
 ```text
 ~/.config/workbreak-guard/runtime-state.json
 ```
+
+
+### Chiamate Slack su Wayland
+
+L’accettazione e la chiusura della chiamata vengono rilevate dal flusso microfono di Slack tramite PipeWire/PulseAudio. Il nome del chiamante viene invece recuperato, quando disponibile, dalla notifica standard del desktop e mantenuto per un intervallo configurabile, predefinito a 180 secondi.
+
+Il nome non è garantito: Slack può nascondere il contenuto delle notifiche, le notifiche possono essere disattivate oppure la formulazione può cambiare. In questi casi la chiamata viene comunque registrata con il nome attività generico. Nelle impostazioni puoi disattivare separatamente il recupero del chiamante e modificare la validità temporale della notifica.
+
+Dal menu dell’icona puoi scegliere **Avvia modalità chiamata manuale**. Durante il conteggio la voce viene sostituita da **Termina modalità chiamata**; alla chiusura viene usato lo stesso flusso della chiamata automatica, compresa la domanda finale sull’argomento e il ripristino dell’attività precedente.
+
+Gli identificativi tecnici temporanei `__wbg_slack_call_*__` vengono ora riparati automaticamente all’avvio. Possono rimanere nello storico soltanto quando una versione precedente viene interrotta prima del consolidamento della chiamata.
 
 ## Voci nella barra
 
@@ -374,3 +404,21 @@ Copyright © 2026 **Giuseppe Mazzullo** — **info@animalsina.work**.
 WorkBreak Guard è distribuito con **PolyForm Noncommercial License 1.0.0**. L’uso, la modifica e la redistribuzione gratuita sono consentiti per finalità non commerciali nel rispetto del file [`LICENSE`](LICENSE) e mantenendo gli avvisi di copyright. Qualsiasi utilizzo commerciale richiede un’autorizzazione scritta separata dell’autore.
 
 I riferimenti dell’autore e la firma sono disponibili anche in [`AUTHORS.md`](AUTHORS.md) e [`NOTICE`](NOTICE).
+
+
+## Rilevamento chiamate Slack su Wayland
+
+La funzione è disattivata per impostazione predefinita. Quando viene abilitata, WorkBreak Guard controlla i flussi di acquisizione audio esposti da PipeWire tramite `pactl` e, come fallback, `pw-dump`. Il prompt appare dopo l'accettazione della chiamata, quando Slack apre il microfono. Alla scomparsa del flusso viene applicata una retention configurabile fino a 60 secondi; la retention conferma la chiusura senza essere aggiunta al tempo della chiamata. Poi il tempo viene consolidato come attività separata e può essere descritto al volo.
+
+Impostazioni disponibili:
+
+- attivazione o disattivazione completa;
+- intervallo di controllo da 1 a 30 secondi;
+- retention di chiusura da 0 a 60 secondi;
+- progetto predefinito, inizialmente `Expomeeting`;
+- nome attività Slack predefinito, inizialmente `Chiamata Slack`;
+- nome attività per la modalità manuale, inizialmente `Chiamata`;
+- richiesta opzionale della descrizione finale;
+- pulsante di verifica immediata del rilevamento.
+
+Dipendenze consigliate: `pulseaudio-utils` per `pactl`; `pipewire-bin` fornisce `pw-dump` come fallback.

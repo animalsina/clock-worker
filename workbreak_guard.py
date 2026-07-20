@@ -30,7 +30,8 @@ Funzioni principali:
 - Calcola festività nazionali, patroni di Este/Firenze e ferie o ricorrenze personalizzate.
 - Impostazioni GTK salvate in ~/.config/workbreak-guard/settings.json.
 - Statistiche salvate in ~/.config/workbreak-guard/activity-log.json.
-- Backup e ripristino JSON locale con seconda copia opzionale su Google Drive.
+- Backup e ripristino JSON locale con un solo file remoto opzionale su Google Drive.
+- Rileva le chiamate Slack su Wayland tramite PipeWire/PulseAudio, correla il chiamante dalle notifiche desktop e le registra come attività separate.
 - AppIndicator/Ayatana tray se disponibile, con etichetta tempo compatta se supportata.
 - Finestra controllo fallback se la tray non è disponibile.
 """
@@ -39,14 +40,17 @@ from __future__ import annotations
 
 import datetime as dt
 import atexit
+import html
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import wave
 import time
 from dataclasses import dataclass, asdict, field
@@ -86,6 +90,7 @@ ACTIVITY_LOG_FILE = CONFIG_DIR / "activity-log.json"
 RUNTIME_STATE_FILE = CONFIG_DIR / "runtime-state.json"
 RESTORE_SAFETY_DIR = CONFIG_DIR / "restore-safety"
 DEFAULT_LOCAL_BACKUP_DIR = CONFIG_DIR / "backups"
+GOOGLE_DRIVE_BACKUP_FILENAME = "workbreak-guard-backup.json"
 PID_FILE = CONFIG_DIR / "app.pid"
 AUTOSTART_DIR = Path.home() / ".config" / "autostart"
 AUTOSTART_FILE = AUTOSTART_DIR / f"{APP_ID}.desktop"
@@ -143,9 +148,19 @@ class Settings:
     google_drive_backup_frequency: str = "off"
     google_drive_backup_folder_uri: str = ""
     google_drive_backup_folder_name: str = ""
+    google_drive_backup_single_file_configured: bool = False
     google_drive_backup_last_success_at: str = ""
     google_drive_backup_last_error: str = ""
     google_drive_backup_last_auto_key: str = ""
+    slack_call_tracking_enabled: bool = False
+    slack_call_detection_interval_seconds: int = 2
+    slack_call_end_retention_seconds: int = 60
+    slack_call_default_project: str = "Expomeeting"
+    slack_call_default_activity: str = "Chiamata Slack"
+    manual_call_default_activity: str = "Chiamata"
+    slack_call_ask_description: bool = True
+    slack_call_detect_caller_name: bool = True
+    slack_call_caller_notification_retention_seconds: int = 180
 
     @classmethod
     def load(cls) -> "Settings":
@@ -219,6 +234,21 @@ class Settings:
         self.google_drive_backup_folder_name = str(
             self.google_drive_backup_folder_name or ""
         ).strip()
+        self.google_drive_backup_single_file_configured = bool(
+            self.google_drive_backup_single_file_configured
+        )
+        if (
+            self.google_drive_backup_folder_uri
+            and not self.google_drive_backup_single_file_configured
+        ):
+            # Le versioni precedenti memorizzavano una cartella arbitraria.
+            # Il nuovo flusso richiede la selezione dell'account e gestisce un
+            # solo file remoto, quindi la vecchia destinazione va riconfigurata.
+            self.google_drive_backup_folder_uri = ""
+            self.google_drive_backup_folder_name = ""
+            self.google_drive_backup_last_error = (
+                "Riconfigura Google Drive per usare il file remoto unico."
+            )
         self.google_drive_backup_last_success_at = str(
             self.google_drive_backup_last_success_at or ""
         ).strip()
@@ -228,6 +258,29 @@ class Settings:
         self.google_drive_backup_last_auto_key = str(
             self.google_drive_backup_last_auto_key or ""
         ).strip()
+        self.slack_call_tracking_enabled = bool(self.slack_call_tracking_enabled)
+        self.slack_call_detection_interval_seconds = clamp_int(
+            self.slack_call_detection_interval_seconds, 1, 30
+        )
+        self.slack_call_end_retention_seconds = clamp_int(
+            self.slack_call_end_retention_seconds, 0, 60
+        )
+        self.slack_call_default_project = str(
+            self.slack_call_default_project or "Expomeeting"
+        ).strip() or "Expomeeting"
+        self.slack_call_default_activity = str(
+            self.slack_call_default_activity or "Chiamata Slack"
+        ).strip() or "Chiamata Slack"
+        self.manual_call_default_activity = str(
+            self.manual_call_default_activity or "Chiamata"
+        ).strip() or "Chiamata"
+        self.slack_call_ask_description = bool(self.slack_call_ask_description)
+        self.slack_call_detect_caller_name = bool(
+            self.slack_call_detect_caller_name
+        )
+        self.slack_call_caller_notification_retention_seconds = clamp_int(
+            self.slack_call_caller_notification_retention_seconds, 15, 600
+        )
         self.active_days = [int(x) for x in self.active_days if int(x) in range(7)] or [0, 1, 2, 3, 4]
         self.morning_start = normalize_time(self.morning_start, "09:00")
         self.morning_end = normalize_time(self.morning_end, "13:00")
@@ -814,6 +867,105 @@ class ChoiceAlertWindow(Gtk.Window):
             self.destroy()
             self.choices[0][1]()
             return True
+        return False
+
+
+class SlackCallDescriptionWindow(Gtk.Window):
+    def __init__(self, app: "WorkBreakApp", call_info: dict):
+        super().__init__(title="Descrizione chiamata")
+        self.app = app
+        self.call_info = call_info
+        self.set_default_size(660, 390)
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+        self.set_keep_above(True)
+        self.set_decorated(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        outer.set_border_width(24)
+        outer.get_style_context().add_class("wb-card")
+        self.add(outer)
+
+        title = Gtk.Label(label="Di cosa avete parlato?")
+        title.get_style_context().add_class("wb-title")
+        title.set_line_wrap(True)
+        title.set_justify(Gtk.Justification.CENTER)
+        outer.pack_start(title, False, False, 0)
+
+        seconds = max(0, int(call_info.get("seconds", 0)))
+        project = str(call_info.get("project", "")).strip()
+        caller_name = str(call_info.get("caller_name", "")).strip()
+        info = Gtk.Label(
+            label=(
+                f"Chiamata registrata per {format_hhmmss(seconds)}"
+                + (f" con {caller_name}" if caller_name else "")
+                + (f" nel progetto {project}." if project else ".")
+                + " La descrizione verrà usata come nome dell’attività."
+            )
+        )
+        info.get_style_context().add_class("wb-body")
+        info.set_line_wrap(True)
+        info.set_justify(Gtk.Justification.CENTER)
+        outer.pack_start(info, False, False, 0)
+
+        self.text = Gtk.TextView()
+        self.text.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.text.set_accepts_tab(False)
+        self.text.set_size_request(-1, 150)
+        text_scrolled = Gtk.ScrolledWindow()
+        text_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        text_scrolled.add(self.text)
+        outer.pack_start(text_scrolled, True, True, 0)
+
+        hint = Gtk.Label(
+            label="Esempio: verifica sincronizzazione accessi e problemi del frontend evento"
+        )
+        hint.set_xalign(0)
+        hint.set_line_wrap(True)
+        outer.pack_start(hint, False, False, 0)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        buttons.set_homogeneous(True)
+        outer.pack_start(buttons, False, False, 0)
+
+        keep = Gtk.Button(label="Lascia descrizione generica")
+        keep.connect("clicked", lambda *_: self._finish(""))
+        buttons.pack_start(keep, True, True, 0)
+
+        save = Gtk.Button(label="Salva descrizione")
+        save.get_style_context().add_class("suggested-action")
+        save.connect("clicked", lambda *_: self._save())
+        buttons.pack_start(save, True, True, 0)
+
+        self.connect("delete-event", self._on_delete)
+        self.show_all()
+        place_on_active_monitor(self, 660, 390)
+        self.present()
+        self.text.grab_focus()
+
+    def _description(self) -> str:
+        buffer = self.text.get_buffer()
+        return buffer.get_text(
+            buffer.get_start_iter(), buffer.get_end_iter(), True
+        ).strip()
+
+    def _save(self) -> None:
+        self._finish(self._description())
+
+    def _finish(self, description: str) -> None:
+        self.destroy()
+        self.app._complete_slack_call_description(
+            self, self.call_info, description
+        )
+
+    def _on_delete(self, *_args) -> bool:
+        GLib.idle_add(
+            self.app._complete_slack_call_description,
+            self,
+            self.call_info,
+            "",
+        )
         return False
 
 
@@ -2956,6 +3108,15 @@ class SettingsWindow(Gtk.Window):
         "beep_count",
         "beep_interval_seconds",
         "markdown_include_task_times",
+        "slack_call_tracking_enabled",
+        "slack_call_detection_interval_seconds",
+        "slack_call_end_retention_seconds",
+        "slack_call_default_project",
+        "slack_call_default_activity",
+        "manual_call_default_activity",
+        "slack_call_ask_description",
+        "slack_call_detect_caller_name",
+        "slack_call_caller_notification_retention_seconds",
     )
 
     def __init__(self, app: "WorkBreakApp"):
@@ -3103,9 +3264,9 @@ class SettingsWindow(Gtk.Window):
 
         google_help = Gtk.Label(
             label=(
-                "Premi Configura e scegli Google Drive da Altre posizioni. "
-                "Se l'account esiste già non devi aggiungerlo di nuovo. È accettata "
-                "anche una cartella locale già sincronizzata con Drive."
+                "Premi Configura e scegli soltanto l’account Google già collegato. "
+                "Non viene sincronizzata una cartella: sul Drive viene creato e "
+                f"aggiornato esclusivamente il file {GOOGLE_DRIVE_BACKUP_FILENAME}."
             )
         )
         google_help.set_xalign(0)
@@ -3153,17 +3314,131 @@ class SettingsWindow(Gtk.Window):
 
         self.backup_now = Gtk.Button(label="Esegui backup adesso")
         self.backup_now.connect(
-            "clicked", lambda *_: self.app.backup_data(
+            "clicked", lambda *_: self.app.backup_data_async(
                 manual=True, parent=self, notify=True
             )
         )
-        action_buttons.attach(self.backup_now, 0, 0, 1, 1)
+        action_buttons.attach(self.backup_now, 0, 0, 2, 1)
 
-        self.backup_restore = Gtk.Button(label="Ripristina da backup")
+        self.backup_restore = Gtk.Button(label="Ripristina da file")
         self.backup_restore.connect(
             "clicked", lambda *_: self.app.restore_from_backup(self)
         )
-        action_buttons.attach(self.backup_restore, 1, 0, 1, 1)
+        action_buttons.attach(self.backup_restore, 0, 1, 1, 1)
+
+        self.google_backup_restore = Gtk.Button(
+            label="Ripristina dal file su Google Drive"
+        )
+        self.google_backup_restore.connect(
+            "clicked",
+            lambda *_: self.app.restore_from_google_drive_backup(self),
+        )
+        action_buttons.attach(self.google_backup_restore, 1, 1, 1, 1)
+
+        slack_frame = Gtk.Frame(label="Modalità chiamate e rilevamento Slack")
+        slack_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        slack_box.set_border_width(10)
+        slack_frame.add(slack_box)
+        content.pack_start(slack_frame, False, False, 0)
+
+        slack_help = Gtk.Label(
+            label=(
+                "Il rilevamento controlla il flusso microfono di Slack tramite "
+                "PipeWire/PulseAudio. La richiesta appare dopo l'accettazione "
+                "della chiamata, non durante lo squillo. Il nome del chiamante "
+                "viene correlato dalla notifica desktop, quando Slack lo espone. "
+                "Dal menu dell’icona puoi inoltre avviare e terminare una "
+                "modalità chiamata manuale per telefono, Meet o altre occasioni."
+            )
+        )
+        slack_help.set_xalign(0)
+        slack_help.set_line_wrap(True)
+        slack_box.pack_start(slack_help, False, False, 0)
+
+        self.slack_call_tracking_enabled = Gtk.CheckButton(
+            label="Rileva le chiamate Slack e proponi il timer dedicato"
+        )
+        self.slack_call_tracking_enabled.set_active(
+            self.edit_settings.slack_call_tracking_enabled
+        )
+        slack_box.pack_start(self.slack_call_tracking_enabled, False, False, 0)
+
+        slack_grid = Gtk.Grid(column_spacing=12, row_spacing=9)
+        slack_box.pack_start(slack_grid, False, False, 0)
+        self.slack_call_detection_interval_seconds = self._spin(
+            self.edit_settings.slack_call_detection_interval_seconds, 1, 30
+        )
+        self.slack_call_end_retention_seconds = self._spin(
+            self.edit_settings.slack_call_end_retention_seconds, 0, 60
+        )
+        self.slack_call_default_project = Gtk.Entry(
+            text=self.edit_settings.slack_call_default_project
+        )
+        self.slack_call_default_activity = Gtk.Entry(
+            text=self.edit_settings.slack_call_default_activity
+        )
+        self.manual_call_default_activity = Gtk.Entry(
+            text=self.edit_settings.manual_call_default_activity
+        )
+        self.slack_call_caller_notification_retention_seconds = self._spin(
+            self.edit_settings.slack_call_caller_notification_retention_seconds,
+            15,
+            600,
+        )
+        slack_row = 0
+        slack_row = self._labeled(
+            slack_grid, slack_row, "Intervallo controllo, secondi",
+            self.slack_call_detection_interval_seconds
+        )
+        slack_row = self._labeled(
+            slack_grid, slack_row, "Retention alla chiusura, secondi (massimo 60)",
+            self.slack_call_end_retention_seconds
+        )
+        slack_row = self._labeled(
+            slack_grid, slack_row, "Progetto predefinito",
+            self.slack_call_default_project
+        )
+        slack_row = self._labeled(
+            slack_grid, slack_row, "Nome attività Slack predefinito",
+            self.slack_call_default_activity
+        )
+        slack_row = self._labeled(
+            slack_grid, slack_row, "Nome attività chiamata manuale",
+            self.manual_call_default_activity
+        )
+        slack_row = self._labeled(
+            slack_grid,
+            slack_row,
+            "Validità nome chiamante da notifica, secondi",
+            self.slack_call_caller_notification_retention_seconds,
+        )
+
+        self.slack_call_detect_caller_name = Gtk.CheckButton(
+            label=(
+                "Prova a recuperare il nome del chiamante dalle notifiche "
+                "desktop di Slack"
+            )
+        )
+        self.slack_call_detect_caller_name.set_active(
+            self.edit_settings.slack_call_detect_caller_name
+        )
+        slack_box.pack_start(
+            self.slack_call_detect_caller_name, False, False, 0
+        )
+
+        self.slack_call_ask_description = Gtk.CheckButton(
+            label="Alla fine chiedi: ‘Di cosa avete parlato?’"
+        )
+        self.slack_call_ask_description.set_active(
+            self.edit_settings.slack_call_ask_description
+        )
+        slack_box.pack_start(self.slack_call_ask_description, False, False, 0)
+
+        slack_test = Gtk.Button(label="Verifica rilevamento Slack adesso")
+        slack_test.connect(
+            "clicked", lambda *_: self.app.test_slack_call_detection(self)
+        )
+        slack_box.pack_start(slack_test, False, False, 0)
 
         grid = Gtk.Grid(column_spacing=12, row_spacing=10)
         grid.set_column_homogeneous(False)
@@ -3402,12 +3677,19 @@ class SettingsWindow(Gtk.Window):
 
         configured = bool(settings.google_drive_backup_folder_uri)
         if not configured:
-            self.google_backup_status.set_text(
-                "Google Drive non configurato. I backup locali continuano a funzionare."
-            )
+            if settings.google_drive_backup_last_error:
+                self.google_backup_status.set_text(
+                    "Google Drive da configurare: "
+                    + settings.google_drive_backup_last_error
+                    + " I backup locali continuano a funzionare."
+                )
+            else:
+                self.google_backup_status.set_text(
+                    "Google Drive non configurato. I backup locali continuano a funzionare."
+                )
             self.google_backup_folder.set_text("")
             self.google_backup_configure.set_label(
-                "Configura backup su Google Drive"
+                "Configura account Google Drive"
             )
         elif settings.google_drive_backup_last_error:
             self.google_backup_status.set_text(
@@ -3415,14 +3697,15 @@ class SettingsWindow(Gtk.Window):
                 + settings.google_drive_backup_last_error
             )
             self.google_backup_folder.set_text(
-                "Destinazione Google: "
+                "Account Google: "
                 + (
                     settings.google_drive_backup_folder_name
                     or settings.google_drive_backup_folder_uri
                 )
+                + f"\nFile remoto unico: {GOOGLE_DRIVE_BACKUP_FILENAME}"
             )
             self.google_backup_configure.set_label(
-                "Cambia cartella Google Drive"
+                "Cambia account Google Drive"
             )
         else:
             drive_last = self._format_backup_time(
@@ -3430,17 +3713,18 @@ class SettingsWindow(Gtk.Window):
             )
             suffix = f" Ultima copia: {drive_last}." if drive_last else ""
             self.google_backup_status.set_text(
-                "Seconda copia Google Drive configurata." + suffix
+                "File di backup Google Drive configurato." + suffix
             )
             self.google_backup_folder.set_text(
-                "Destinazione Google: "
+                "Account Google: "
                 + (
                     settings.google_drive_backup_folder_name
                     or settings.google_drive_backup_folder_uri
                 )
+                + f"\nFile remoto unico: {GOOGLE_DRIVE_BACKUP_FILENAME}"
             )
             self.google_backup_configure.set_label(
-                "Cambia cartella Google Drive"
+                "Cambia account Google Drive"
             )
 
         frequency = settings.google_drive_backup_frequency
@@ -3471,6 +3755,7 @@ class SettingsWindow(Gtk.Window):
         any_destination = settings.local_backup_enabled or configured
         self.backup_now.set_sensitive(any_destination)
         self.backup_restore.set_sensitive(True)
+        self.google_backup_restore.set_sensitive(configured)
         self.google_backup_disconnect.set_sensitive(configured)
         self.local_backup_choose.set_sensitive(settings.local_backup_enabled)
 
@@ -3524,6 +3809,33 @@ class SettingsWindow(Gtk.Window):
         pending.markdown_include_task_times = (
             self.markdown_include_task_times.get_active()
         )
+        pending.slack_call_tracking_enabled = (
+            self.slack_call_tracking_enabled.get_active()
+        )
+        pending.slack_call_detection_interval_seconds = int(
+            self.slack_call_detection_interval_seconds.get_value()
+        )
+        pending.slack_call_end_retention_seconds = int(
+            self.slack_call_end_retention_seconds.get_value()
+        )
+        pending.slack_call_default_project = (
+            self.slack_call_default_project.get_text().strip() or "Expomeeting"
+        )
+        pending.slack_call_default_activity = (
+            self.slack_call_default_activity.get_text().strip() or "Chiamata Slack"
+        )
+        pending.manual_call_default_activity = (
+            self.manual_call_default_activity.get_text().strip() or "Chiamata"
+        )
+        pending.slack_call_ask_description = (
+            self.slack_call_ask_description.get_active()
+        )
+        pending.slack_call_detect_caller_name = (
+            self.slack_call_detect_caller_name.get_active()
+        )
+        pending.slack_call_caller_notification_retention_seconds = int(
+            self.slack_call_caller_notification_retention_seconds.get_value()
+        )
         try:
             pending.extra_closure_weekday = int(
                 self.extra_closure_weekday.get_active_id() or 0
@@ -3553,6 +3865,7 @@ class SettingsWindow(Gtk.Window):
         # salvare non deve mai alterare fase, residuo o attività corrente.
         for field_name in self.IMMEDIATE_FIELDS:
             setattr(current, field_name, getattr(pending, field_name))
+        self.app._slack_settings_changed()
 
         set_autostart_enabled(self.autostart_enabled.get_active())
         self.enabled.set_active(current.enabled)
@@ -3716,6 +4029,7 @@ class WorkBreakApp:
         self.stats_save_counter = 0
         self.runtime_save_counter = 0
         self.activity_log = self._load_activity_log()
+        self._repair_orphaned_call_activities()
         self._finalize_unclosed_past_days()
         self._ensure_due_balance_settlements()
 
@@ -3748,9 +4062,36 @@ class WorkBreakApp:
         self.sound_files: dict[str, Path] = {}
         self.beep_file = self._build_sound_file("soft")
         self._backup_busy = False
+        self._backup_state_lock = threading.Lock()
+        self._gtk_thread_id = threading.get_ident()
         self._restored_data_pending_restart = False
         self._backup_attempted_targets: set[str] = set()
         self._backup_next_check_monotonic = 0.0
+
+        self.slack_call_prompt_window: Optional[ChoiceAlertWindow] = None
+        self.slack_call_description_windows: list[SlackCallDescriptionWindow] = []
+        self.slack_call_tracking_active = False
+        self.slack_call_manual_mode = False
+        self.slack_call_stream_present = False
+        self.slack_call_prompted_for_presence = False
+        self.slack_call_end_missing_since: Optional[float] = None
+        self.slack_call_end_missing_wall_at: Optional[dt.datetime] = None
+        self.slack_call_id = ""
+        self.slack_call_temp_activity = ""
+        self.slack_call_project = ""
+        self.slack_call_caller_name = ""
+        self.slack_call_started_at: Optional[dt.datetime] = None
+        self.slack_call_allocations: dict[str, int] = {}
+        self.slack_call_last_detection_detail = ""
+        self.slack_call_last_notification_detail = ""
+        self.slack_call_pending_caller_name = ""
+        self.slack_call_pending_caller_detected_at = 0.0
+        self._slack_detection_busy = False
+        self._slack_next_detection_monotonic = 0.0
+        self._slack_notification_monitor_thread: Optional[threading.Thread] = None
+        self._slack_notification_monitor_process: Optional[subprocess.Popen] = None
+        self._slack_notification_monitor_stop = threading.Event()
+        self._slack_notification_monitor_last_start = 0.0
 
         self._setup_indicator_or_control()
         self._restore_latest_activity()
@@ -3762,6 +4103,8 @@ class WorkBreakApp:
         else:
             self._sync_session(now, force=True)
         GLib.timeout_add_seconds(1, self.tick)
+        GLib.timeout_add_seconds(1, self._schedule_slack_call_detection)
+        self._ensure_slack_notification_monitor()
         GLib.idle_add(self._show_pending_summary_if_needed)
         signal.signal(signal.SIGINT, lambda *_: self.quit())
         signal.signal(signal.SIGTERM, lambda *_: self.quit())
@@ -3789,6 +4132,1102 @@ class WorkBreakApp:
         # I signal Python possono arrivare fuori dal ciclo GTK: rimandiamo l'apertura
         # della finestra al main loop per evitare accessi concorrenti alla UI.
         GLib.idle_add(self.request_activity_prompt)
+
+    @staticmethod
+    def _clean_subprocess_env() -> dict[str, str]:
+        """Restituisce un ambiente sicuro per i comandi di sistema.
+
+        I terminali avviati da applicazioni Snap, IDE o AppImage possono
+        esportare percorsi verso una glibc privata, per esempio quella di
+        ``/snap/core20``. Anche usando un eseguibile di sistema, queste variabili
+        possono provocare errori ``GLIBC_PRIVATE`` o caricare moduli GTK/GIO non
+        compatibili con Ubuntu. Manteniamo le variabili di sessione Wayland e
+        D-Bus, ma rimuoviamo esclusivamente i percorsi di runtime incorporati.
+        """
+        env = os.environ.copy()
+        unsafe_keys = {
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "LD_AUDIT",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "GTK_PATH",
+            "GIO_MODULE_DIR",
+            "GIO_EXTRA_MODULES",
+            "GI_TYPELIB_PATH",
+            "GSETTINGS_SCHEMA_DIR",
+            "LIBGL_DRIVERS_PATH",
+            "LIBVA_DRIVERS_PATH",
+            "VK_ICD_FILENAMES",
+            "SNAP",
+            "SNAP_ARCH",
+            "SNAP_COMMON",
+            "SNAP_CONTEXT",
+            "SNAP_COOKIE",
+            "SNAP_DATA",
+            "SNAP_INSTANCE_KEY",
+            "SNAP_INSTANCE_NAME",
+            "SNAP_LIBRARY_PATH",
+            "SNAP_NAME",
+            "SNAP_REAL_HOME",
+            "SNAP_REEXEC",
+            "SNAP_REVISION",
+            "SNAP_USER_COMMON",
+            "SNAP_USER_DATA",
+            "SNAP_VERSION",
+        }
+        for key in unsafe_keys:
+            env.pop(key, None)
+        env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        env["XDG_DATA_DIRS"] = "/usr/local/share:/usr/share:/var/lib/snapd/desktop"
+        return env
+
+    @staticmethod
+    def _is_internal_call_activity(value: object) -> bool:
+        return bool(
+            re.fullmatch(
+                r"__wbg_(?:slack_)?call_[A-Za-z0-9_-]+__",
+                str(value or "").strip(),
+            )
+        )
+
+    def _call_base_activity(
+        self, manual_mode: bool = False, caller_name: str = ""
+    ) -> str:
+        base = (
+            self.settings.manual_call_default_activity
+            if manual_mode
+            else self.settings.slack_call_default_activity
+        ).strip()
+        base = base or ("Chiamata" if manual_mode else "Chiamata Slack")
+        caller_name = " ".join(str(caller_name or "").split())
+        if caller_name and not manual_mode:
+            base = f"{base} con {caller_name}"
+        return base
+
+    def _repair_orphaned_call_activities(self) -> None:
+        """Consolida le chiamate rimaste con l'identificativo tecnico.
+
+        Può accadere se il processo viene terminato brutalmente, se un comando
+        esterno manda in errore l'istanza o durante un aggiornamento. Il valore
+        ``__wbg_slack_call_*__`` è solo una chiave temporanea e non deve mai
+        comparire nei riepiloghi dell'utente.
+        """
+        changed = False
+        for stats in self.activity_log.get("days", {}).values():
+            if not isinstance(stats, dict):
+                continue
+            events = stats.get("activities", [])
+            event_info: dict[tuple[str, str], dict] = {}
+            if isinstance(events, list):
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    text = str(event.get("text", "")).strip()
+                    if not (
+                        self._is_internal_call_activity(text)
+                        or (event.get("temporary") and event.get("slack_call"))
+                    ):
+                        continue
+                    project = str(event.get("project", "")).strip()
+                    manual_mode = bool(
+                        event.get("manual_call")
+                        or event.get("call_source") == "manual"
+                    )
+                    caller_name = " ".join(
+                        str(event.get("caller_name", "") or "").split()
+                    )
+                    description = " ".join(
+                        str(event.get("description", "") or "").split()
+                    )
+                    final_activity = self._call_base_activity(
+                        manual_mode, caller_name
+                    )
+                    if description:
+                        final_activity = f"{final_activity} — {description}"
+                    event_info[(text.casefold(), project.casefold())] = {
+                        "activity": final_activity,
+                        "caller_name": caller_name,
+                        "manual_mode": manual_mode,
+                    }
+                    event["text"] = final_activity
+                    event["temporary"] = False
+                    event["recovered_after_interruption"] = True
+                    changed = True
+
+            totals = stats.get("activity_totals", [])
+            if not isinstance(totals, list):
+                continue
+            merged: list[dict] = []
+            for item in totals:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text", "")).strip()
+                project = str(item.get("project", "")).strip()
+                if self._is_internal_call_activity(text):
+                    info = event_info.get(
+                        (text.casefold(), project.casefold()), {}
+                    )
+                    item = dict(item)
+                    item["text"] = str(
+                        info.get("activity")
+                        or self._call_base_activity(False, "")
+                    )
+                    item["temporary"] = False
+                    item["recovered_after_interruption"] = True
+                    if info.get("caller_name"):
+                        item["caller_name"] = info["caller_name"]
+                    changed = True
+
+                target = None
+                for existing in merged:
+                    if self._same_activity(
+                        existing,
+                        str(item.get("text", "")),
+                        str(item.get("project", "")),
+                    ):
+                        target = existing
+                        break
+                if target is None:
+                    merged.append(item)
+                else:
+                    target["work_seconds"] = max(
+                        0, int(target.get("work_seconds", 0))
+                    ) + max(0, int(item.get("work_seconds", 0)))
+                    if str(item.get("last_used", "")) > str(
+                        target.get("last_used", "")
+                    ):
+                        target["last_used"] = item.get("last_used", "")
+                    changed = True
+            if merged != totals:
+                stats["activity_totals"] = merged
+
+        if changed:
+            self._save_activity_log()
+
+    @staticmethod
+    def _decode_dbus_string(line: str) -> str:
+        raw = str(line or "").strip()
+        raw = re.sub(r"^variant\s+string\s+", "variant string ", raw)
+        prefix = ""
+        for candidate in ("string ", "variant string "):
+            if raw.startswith(candidate):
+                prefix = candidate
+                break
+        if not prefix:
+            return ""
+        encoded = raw[len(prefix):].strip()
+        try:
+            value = json.loads(encoded)
+            return str(value)
+        except Exception:
+            if len(encoded) >= 2 and encoded[0] == '"' and encoded[-1] == '"':
+                encoded = encoded[1:-1]
+            return bytes(encoded, "utf-8").decode(
+                "unicode_escape", errors="replace"
+            )
+
+    @staticmethod
+    def _notification_plain_text(value: str) -> str:
+        text = html.unescape(str(value or ""))
+        text = re.sub(r"<[^>]+>", " ", text)
+        return " ".join(text.split())
+
+    @classmethod
+    def _extract_slack_caller_name(
+        cls, summary: str, body: str
+    ) -> str:
+        clean_summary = cls._notification_plain_text(summary)
+        clean_body = cls._notification_plain_text(body)
+        texts = [clean_body, clean_summary]
+        patterns = (
+            r"^(?:incoming call|call incoming|chiamata in arrivo)\s+(?:from|da)\s+(.+?)(?:[.!]|$)",
+            r"^(?:call from|chiamata da)\s+(.+?)(?:[.!]|$)",
+            r"^(?:call|huddle|chiamata)\s+(?:with|con)\s+(.+?)(?:[.!]|$)",
+            r"^(.+?)\s+(?:is calling(?: you)?|ti sta chiamando|sta chiamando|ha avviato una chiamata|ha iniziato una chiamata|started a call|started a huddle|ha avviato un huddle|ha iniziato un huddle|ti ha invitato a un huddle)\b",
+            r"^(.+?)\s+(?:started|avviato|iniziato)\s+(?:a|una|un)?\s*(?:call|huddle|chiamata)\b",
+        )
+        candidate = ""
+        for text in texts:
+            for pattern in patterns:
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if match:
+                    candidate = match.group(1)
+                    break
+            if candidate:
+                break
+
+        generic_call_markers = (
+            "incoming call",
+            "call incoming",
+            "chiamata in arrivo",
+            "is calling",
+            "calling you",
+            "ti sta chiamando",
+            "sta chiamando",
+            "started a call",
+            "ha avviato una chiamata",
+            "huddle",
+        )
+        if not candidate and any(
+            marker in clean_body.casefold() for marker in generic_call_markers
+        ):
+            candidate = clean_summary
+        if not candidate and any(
+            marker in clean_summary.casefold() for marker in generic_call_markers
+        ):
+            candidate = clean_body
+
+        candidate = cls._notification_plain_text(candidate)
+        candidate = re.sub(
+            r"\s*[-–—|]\s*(?:Slack|incoming call|chiamata in arrivo).*$",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip(" .,:;–—-")
+        generic_values = {
+            "",
+            "slack",
+            "incoming call",
+            "call incoming",
+            "chiamata in arrivo",
+            "new call",
+            "nuova chiamata",
+            "huddle",
+        }
+        if candidate.casefold() in generic_values:
+            return ""
+        if len(candidate) > 100:
+            candidate = candidate[:100].rstrip()
+        return candidate
+
+    @classmethod
+    def _parse_slack_notification_block(
+        cls, lines: list[str]
+    ) -> tuple[str, str]:
+        header = str(lines[0] if lines else "")
+        if "member=AddNotification" in header:
+            return cls._parse_slack_portal_notification_block(lines)
+
+        values = [
+            cls._decode_dbus_string(line)
+            for line in lines
+            if str(line).lstrip().startswith("string ")
+        ]
+        if len(values) < 4:
+            return "", ""
+        app_name, app_icon, summary, body = values[:4]
+        identity = f"{app_name} {app_icon}".casefold()
+        if "slack" not in identity:
+            return "", ""
+        caller = cls._extract_slack_caller_name(summary, body)
+        detail = " | ".join(
+            item for item in (
+                cls._notification_plain_text(summary),
+                cls._notification_plain_text(body),
+            ) if item
+        )
+        return caller, detail
+
+    @classmethod
+    def _parse_slack_portal_notification_block(
+        cls, lines: list[str]
+    ) -> tuple[str, str]:
+        decoded = [cls._decode_dbus_string(line) for line in lines]
+        decoded = [value for value in decoded if value != ""]
+        if not decoded:
+            return "", ""
+        app_id = decoded[0]
+        if "slack" not in app_id.casefold():
+            return "", ""
+
+        title = ""
+        body = ""
+        for index, line in enumerate(lines):
+            key = cls._decode_dbus_string(line).casefold()
+            if key not in {"title", "body"}:
+                continue
+            for candidate_line in lines[index + 1:index + 6]:
+                value = cls._decode_dbus_string(candidate_line)
+                if value:
+                    if key == "title":
+                        title = value
+                    else:
+                        body = value
+                    break
+        caller = cls._extract_slack_caller_name(title, body)
+        detail = " | ".join(
+            item for item in (
+                cls._notification_plain_text(title),
+                cls._notification_plain_text(body),
+            ) if item
+        )
+        return caller, detail
+
+    def _monitor_slack_notifications(self) -> None:
+        monitor = shutil.which("dbus-monitor")
+        if not monitor:
+            GLib.idle_add(
+                self._apply_slack_notification_monitor_status,
+                "dbus-monitor non installato: nome chiamante non disponibile",
+            )
+            return
+        command = [
+            monitor,
+            "--session",
+            "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
+            "type='method_call',interface='org.freedesktop.portal.Notification',member='AddNotification'",
+        ]
+        process: Optional[subprocess.Popen] = None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                env=self._clean_subprocess_env(),
+            )
+            self._slack_notification_monitor_process = process
+            block: list[str] = []
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                if self._slack_notification_monitor_stop.is_set():
+                    break
+                line = raw_line.rstrip("\n")
+                is_message_header = line.startswith(
+                    ("method call", "method return", "signal", "error")
+                )
+                if is_message_header:
+                    if block:
+                        caller, detail = self._parse_slack_notification_block(
+                            block
+                        )
+                        if caller or detail:
+                            GLib.idle_add(
+                                self._apply_slack_notification,
+                                caller,
+                                detail,
+                            )
+                    block = (
+                        [line]
+                        if line.startswith("method call")
+                        and (
+                            "member=Notify" in line
+                            or "member=AddNotification" in line
+                        )
+                        else []
+                    )
+                elif block:
+                    block.append(line)
+                    # expire_timeout è l'ultimo argomento di Notify. Elaborare
+                    # qui evita di aspettare la notifica successiva prima di
+                    # rendere disponibile il nome del chiamante.
+                    if line.startswith("   int32 "):
+                        caller, detail = self._parse_slack_notification_block(
+                            block
+                        )
+                        if caller or detail:
+                            GLib.idle_add(
+                                self._apply_slack_notification,
+                                caller,
+                                detail,
+                            )
+                        block = []
+                    elif (
+                        "member=AddNotification" in block[0]
+                        and line == "   ]"
+                    ):
+                        caller, detail = self._parse_slack_notification_block(
+                            block
+                        )
+                        if caller or detail:
+                            GLib.idle_add(
+                                self._apply_slack_notification,
+                                caller,
+                                detail,
+                            )
+                        block = []
+            if block:
+                caller, detail = self._parse_slack_notification_block(block)
+                if caller or detail:
+                    GLib.idle_add(
+                        self._apply_slack_notification, caller, detail
+                    )
+        except Exception as exc:
+            GLib.idle_add(
+                self._apply_slack_notification_monitor_status,
+                f"Monitor notifiche Slack non disponibile: {exc}",
+            )
+        finally:
+            if process is not None:
+                try:
+                    process.stdout.close() if process.stdout else None
+                except Exception:
+                    pass
+                try:
+                    if process.poll() is None:
+                        process.terminate()
+                except Exception:
+                    pass
+            self._slack_notification_monitor_process = None
+
+    def _apply_slack_notification_monitor_status(self, detail: str) -> bool:
+        self.slack_call_last_notification_detail = str(detail or "")
+        return False
+
+    def _apply_slack_notification(
+        self, caller_name: str, detail: str
+    ) -> bool:
+        self.slack_call_last_notification_detail = detail
+        if not self.settings.slack_call_detect_caller_name:
+            return False
+        caller_name = " ".join(str(caller_name or "").split())
+        if not caller_name:
+            return False
+        if self.slack_call_tracking_active:
+            if self.slack_call_manual_mode:
+                return False
+            if not self.slack_call_caller_name:
+                self.slack_call_caller_name = caller_name
+                for day_stats in self.activity_log.get("days", {}).values():
+                    if not isinstance(day_stats, dict):
+                        continue
+                    for event in day_stats.get("activities", []):
+                        if (
+                            isinstance(event, dict)
+                            and str(event.get("slack_call_id", ""))
+                            == self.slack_call_id
+                        ):
+                            event["caller_name"] = caller_name
+                self._save_activity_log()
+                self.update_indicator_menu()
+                self._update_ui()
+            return False
+        self.slack_call_pending_caller_name = caller_name
+        self.slack_call_pending_caller_detected_at = time.monotonic()
+        if (
+            self.slack_call_prompt_window
+            and not self.slack_call_tracking_active
+        ):
+            try:
+                self.slack_call_prompt_window.destroy()
+            except Exception:
+                pass
+            self.slack_call_prompt_window = None
+            self._show_slack_call_start_prompt()
+        return False
+
+    def _stop_slack_notification_monitor(self) -> None:
+        self._slack_notification_monitor_stop.set()
+        process = self._slack_notification_monitor_process
+        if process is not None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    def _ensure_slack_notification_monitor(self) -> None:
+        enabled = (
+            self.settings.slack_call_tracking_enabled
+            and self.settings.slack_call_detect_caller_name
+        )
+        if not enabled:
+            self._stop_slack_notification_monitor()
+            return
+        thread = self._slack_notification_monitor_thread
+        if thread is not None and thread.is_alive():
+            return
+        now = time.monotonic()
+        if now - self._slack_notification_monitor_last_start < 10:
+            return
+        self._slack_notification_monitor_last_start = now
+        self._slack_notification_monitor_stop = threading.Event()
+        self._slack_notification_monitor_thread = threading.Thread(
+            target=self._monitor_slack_notifications,
+            daemon=True,
+            name="wbg-slack-notifications",
+        )
+        self._slack_notification_monitor_thread.start()
+
+    def _pending_slack_caller_name(self) -> str:
+        if not self.settings.slack_call_detect_caller_name:
+            return ""
+        if not self.slack_call_pending_caller_name:
+            return ""
+        retention = max(
+            15,
+            int(
+                self.settings.slack_call_caller_notification_retention_seconds
+            ),
+        )
+        if (
+            time.monotonic() - self.slack_call_pending_caller_detected_at
+            > retention
+        ):
+            self.slack_call_pending_caller_name = ""
+            self.slack_call_pending_caller_detected_at = 0.0
+            return ""
+        return self.slack_call_pending_caller_name
+
+    def _slack_settings_changed(self) -> None:
+        self._slack_next_detection_monotonic = 0.0
+        self._ensure_slack_notification_monitor()
+        if not self.settings.slack_call_detect_caller_name:
+            self.slack_call_pending_caller_name = ""
+            self.slack_call_pending_caller_detected_at = 0.0
+        if not self.settings.slack_call_tracking_enabled:
+            if self.slack_call_prompt_window:
+                try:
+                    self.slack_call_prompt_window.destroy()
+                except Exception:
+                    pass
+                self.slack_call_prompt_window = None
+            if (
+                self.slack_call_tracking_active
+                and not self.slack_call_manual_mode
+            ):
+                self._finish_slack_call_tracking()
+        self._update_ui()
+
+    @staticmethod
+    def _slack_props_text(props: object) -> str:
+        if not isinstance(props, dict):
+            return ""
+        return " ".join(
+            f"{key}={value}" for key, value in props.items()
+        ).casefold()
+
+    def _detect_slack_microphone_stream(self) -> tuple[bool, str]:
+        pactl = shutil.which("pactl")
+        if pactl:
+            try:
+                result = subprocess.run(
+                    [pactl, "-f", "json", "list", "source-outputs"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                    check=False,
+                    env=self._clean_subprocess_env(),
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    payload = json.loads(result.stdout)
+                    if isinstance(payload, list):
+                        for item in payload:
+                            if not isinstance(item, dict):
+                                continue
+                            props = item.get("properties", {})
+                            text = self._slack_props_text(props)
+                            if "slack" in text:
+                                name = (
+                                    str(props.get("application.name", ""))
+                                    or str(props.get("application.process.binary", ""))
+                                    or "Slack"
+                                )
+                                return True, f"pactl: {name}"
+                    pactl_error = (
+                        "pactl disponibile: nessun flusso microfono Slack"
+                    )
+                else:
+                    pactl_error = "pactl: output non leggibile"
+            except Exception as exc:
+                pactl_error = str(exc)
+        else:
+            pactl_error = "pactl non installato"
+
+        pw_dump = shutil.which("pw-dump")
+        if pw_dump:
+            try:
+                result = subprocess.run(
+                    [pw_dump],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.5,
+                    check=False,
+                    env=self._clean_subprocess_env(),
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    payload = json.loads(result.stdout)
+                    if isinstance(payload, list):
+                        for item in payload:
+                            if not isinstance(item, dict):
+                                continue
+                            info = item.get("info", {})
+                            props = (
+                                info.get("props", {})
+                                if isinstance(info, dict)
+                                else {}
+                            )
+                            if not isinstance(props, dict):
+                                continue
+                            media_class = str(
+                                props.get("media.class", "")
+                            ).casefold()
+                            text = self._slack_props_text(props)
+                            if (
+                                "slack" in text
+                                and (
+                                    "stream/input/audio" in media_class
+                                    or "audio/source" in media_class
+                                    or "input" in media_class
+                                )
+                            ):
+                                name = (
+                                    str(props.get("application.name", ""))
+                                    or str(props.get("node.name", ""))
+                                    or "Slack"
+                                )
+                                return True, f"pw-dump: {name}"
+                    return (
+                        False,
+                        "pw-dump disponibile: nessun flusso microfono Slack",
+                    )
+            except Exception as exc:
+                return (
+                    False,
+                    "Rilevamento non riuscito: "
+                    f"pactl ({pactl_error}); pw-dump ({exc})",
+                )
+        return (
+            False,
+            f"{pactl_error}; pw-dump non installato",
+        )
+
+    def _schedule_slack_call_detection(self) -> bool:
+        if not self.settings.slack_call_tracking_enabled:
+            return True
+        self._ensure_slack_notification_monitor()
+        now_mono = time.monotonic()
+        if (
+            self._slack_detection_busy
+            or now_mono < self._slack_next_detection_monotonic
+        ):
+            return True
+        self._slack_next_detection_monotonic = (
+            now_mono
+            + max(
+                1,
+                int(self.settings.slack_call_detection_interval_seconds),
+            )
+        )
+        self._slack_detection_busy = True
+
+        def worker() -> None:
+            detected, detail = self._detect_slack_microphone_stream()
+            GLib.idle_add(
+                self._apply_slack_call_detection,
+                detected,
+                detail,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _apply_slack_call_detection(
+        self, detected: bool, detail: str
+    ) -> bool:
+        self._slack_detection_busy = False
+        self.slack_call_last_detection_detail = detail
+        if not self.settings.slack_call_tracking_enabled:
+            return False
+
+        was_present = self.slack_call_stream_present
+        self.slack_call_stream_present = bool(detected)
+        if detected:
+            self.slack_call_end_missing_since = None
+            self.slack_call_end_missing_wall_at = None
+            if not was_present:
+                self.slack_call_prompted_for_presence = False
+            if (
+                not self.slack_call_tracking_active
+                and not self.slack_call_prompted_for_presence
+            ):
+                self.slack_call_prompted_for_presence = True
+                self._show_slack_call_start_prompt()
+        else:
+            if (
+                self.slack_call_prompt_window
+                and not self.slack_call_tracking_active
+            ):
+                try:
+                    self.slack_call_prompt_window.destroy()
+                except Exception:
+                    pass
+                self.slack_call_prompt_window = None
+            if (
+                self.slack_call_tracking_active
+                and not self.slack_call_manual_mode
+            ):
+                if self.slack_call_end_missing_since is None:
+                    self.slack_call_end_missing_since = time.monotonic()
+                    self.slack_call_end_missing_wall_at = dt.datetime.now()
+                retention = max(
+                    0,
+                    int(self.settings.slack_call_end_retention_seconds),
+                )
+                if (
+                    time.monotonic() - self.slack_call_end_missing_since
+                    >= retention
+                ):
+                    self._finish_slack_call_tracking()
+            elif was_present:
+                self.slack_call_prompted_for_presence = False
+                self.slack_call_pending_caller_name = ""
+                self.slack_call_pending_caller_detected_at = 0.0
+        self._update_ui()
+        return False
+
+    def _show_slack_call_start_prompt(self) -> None:
+        if (
+            self.slack_call_prompt_window
+            and self.slack_call_prompt_window.get_visible()
+        ):
+            self.slack_call_prompt_window.present()
+            return
+        project = self.settings.slack_call_default_project
+        caller_name = self._pending_slack_caller_name()
+        caller_text = (
+            f" da “{caller_name}”" if caller_name else ""
+        )
+        self.slack_call_prompt_window = ChoiceAlertWindow(
+            f"Chiamata Slack{caller_text} accettata",
+            (
+                "Slack ha iniziato a usare il microfono. Vuoi conteggiare "
+                + (
+                    f"la chiamata con “{caller_name}” "
+                    if caller_name
+                    else "questa chiamata "
+                )
+                + "come attività separata nel progetto "
+                f"“{project}”? Al termine tornerai automaticamente "
+                "all’attività precedente."
+            ),
+            [
+                (
+                    "Avvia timer chiamata",
+                    self._start_slack_call_tracking,
+                ),
+                (
+                    "Ignora questa chiamata",
+                    self._decline_slack_call_tracking,
+                ),
+            ],
+        )
+
+    def _decline_slack_call_tracking(self) -> None:
+        self.slack_call_prompt_window = None
+        self.slack_call_prompted_for_presence = True
+
+    def _start_manual_call_tracking(self) -> None:
+        if self.slack_call_tracking_active:
+            return
+        if self.slack_call_prompt_window:
+            try:
+                self.slack_call_prompt_window.destroy()
+            except Exception:
+                pass
+            self.slack_call_prompt_window = None
+        self._start_slack_call_tracking(manual_mode=True)
+
+    def _start_slack_call_tracking(
+        self, manual_mode: bool = False
+    ) -> None:
+        self.slack_call_prompt_window = None
+        if self.slack_call_tracking_active:
+            return
+        now = dt.datetime.now()
+        self.slack_call_tracking_active = True
+        self.slack_call_manual_mode = bool(manual_mode)
+        self.slack_call_end_missing_since = None
+        self.slack_call_end_missing_wall_at = None
+        self.slack_call_id = now.strftime("%Y%m%d-%H%M%S-%f")
+        self.slack_call_temp_activity = (
+            f"__wbg_slack_call_{self.slack_call_id}__"
+        )
+        self.slack_call_project = (
+            self.settings.slack_call_default_project.strip()
+            or "Expomeeting"
+        )
+        self.slack_call_caller_name = (
+            ""
+            if self.slack_call_manual_mode
+            else self._pending_slack_caller_name()
+        )
+        self.slack_call_pending_caller_name = ""
+        self.slack_call_pending_caller_detected_at = 0.0
+        self.slack_call_started_at = now
+        self.slack_call_allocations = {}
+
+        stats = self._stats_for(now.date())
+        stats.setdefault("activities", []).append(
+            {
+                "time": now.isoformat(timespec="seconds"),
+                "text": self.slack_call_temp_activity,
+                "project": self.slack_call_project,
+                "slack_call": not self.slack_call_manual_mode,
+                "manual_call": self.slack_call_manual_mode,
+                "call_source": (
+                    "manual" if self.slack_call_manual_mode else "slack"
+                ),
+                "slack_call_id": self.slack_call_id,
+                "caller_name": self.slack_call_caller_name,
+                "temporary": True,
+            }
+        )
+        stats["summary_shown"] = False
+        self._save_activity_log()
+        self._save_runtime_state(force=True)
+        self.update_indicator_menu()
+        self._update_ui()
+
+    def _recording_activity(self) -> tuple[str, str]:
+        if (
+            self.slack_call_tracking_active
+            and self.slack_call_temp_activity
+        ):
+            return (
+                self.slack_call_temp_activity,
+                self.slack_call_project,
+            )
+        return self.current_activity, self.current_project
+
+    def _record_slack_call_independent_second(
+        self, day: dt.date
+    ) -> None:
+        if not self.slack_call_tracking_active:
+            return
+        self._record_work_seconds(day, 1, overtime=False)
+
+    def _finish_slack_call_tracking(
+        self, ask_description: Optional[bool] = None
+    ) -> None:
+        if not self.slack_call_tracking_active:
+            return
+        ended_at = self.slack_call_end_missing_wall_at or dt.datetime.now()
+        call_info = {
+            "id": self.slack_call_id,
+            "temp_activity": self.slack_call_temp_activity,
+            "project": self.slack_call_project,
+            "caller_name": self.slack_call_caller_name,
+            "manual_mode": self.slack_call_manual_mode,
+            "call_source": (
+                "manual" if self.slack_call_manual_mode else "slack"
+            ),
+            "started_at": (
+                self.slack_call_started_at.isoformat(timespec="seconds")
+                if self.slack_call_started_at
+                else ""
+            ),
+            "ended_at": ended_at.isoformat(timespec="seconds"),
+            "start_day": (
+                self.slack_call_started_at.date().isoformat()
+                if self.slack_call_started_at
+                else ended_at.date().isoformat()
+            ),
+            "allocations": dict(self.slack_call_allocations),
+            "seconds": sum(
+                max(0, int(value))
+                for value in self.slack_call_allocations.values()
+            ),
+        }
+        finished_manual_mode = self.slack_call_manual_mode
+        self.slack_call_tracking_active = False
+        self.slack_call_manual_mode = False
+        self.slack_call_end_missing_since = None
+        self.slack_call_end_missing_wall_at = None
+        self.slack_call_id = ""
+        self.slack_call_temp_activity = ""
+        self.slack_call_project = ""
+        self.slack_call_caller_name = ""
+        self.slack_call_pending_caller_name = ""
+        self.slack_call_pending_caller_detected_at = 0.0
+        self.slack_call_started_at = None
+        self.slack_call_allocations = {}
+        if finished_manual_mode and self.slack_call_stream_present:
+            # Evita che una chiamata Slack già in corso venga proposta subito
+            # dopo aver chiuso manualmente la stessa modalità.
+            self.slack_call_prompted_for_presence = True
+        self._save_runtime_state(force=True)
+        self.update_indicator_menu()
+
+        should_ask_description = (
+            self.settings.slack_call_ask_description
+            if ask_description is None
+            else bool(ask_description)
+        )
+        if call_info["seconds"] <= 0:
+            self._complete_slack_call_description(
+                None, call_info, ""
+            )
+        elif should_ask_description:
+            window = SlackCallDescriptionWindow(self, call_info)
+            self.slack_call_description_windows.append(window)
+        else:
+            self._complete_slack_call_description(
+                None, call_info, ""
+            )
+        self._update_ui()
+
+    def _complete_slack_call_description(
+        self,
+        window: Optional[SlackCallDescriptionWindow],
+        call_info: dict,
+        description: str,
+    ) -> bool:
+        if window in self.slack_call_description_windows:
+            self.slack_call_description_windows.remove(window)
+        manual_mode = bool(
+            call_info.get("manual_mode")
+            or call_info.get("call_source") == "manual"
+        )
+        caller_name = " ".join(
+            str(call_info.get("caller_name", "") or "").split()
+        )
+        base_activity = self._call_base_activity(
+            manual_mode, caller_name
+        )
+        description = " ".join(str(description or "").split())
+        final_activity = (
+            f"{base_activity} — {description}"
+            if description
+            else base_activity
+        )
+        temp_activity = str(
+            call_info.get("temp_activity", "")
+        ).strip()
+        project = str(call_info.get("project", "")).strip()
+        allocations = call_info.get("allocations", {})
+        if not isinstance(allocations, dict):
+            allocations = {}
+
+        day_keys = set(str(key) for key in allocations)
+        start_day = str(call_info.get("start_day", "")).strip()
+        if start_day:
+            day_keys.add(start_day)
+
+        for day_key in sorted(day_keys):
+            try:
+                allocated_seconds = max(
+                    0, int(allocations.get(day_key, 0))
+                )
+            except Exception:
+                allocated_seconds = 0
+            stats = self.activity_log.get("days", {}).get(
+                str(day_key), {}
+            )
+            if not isinstance(stats, dict):
+                continue
+            totals = stats.setdefault("activity_totals", [])
+            source = None
+            for item in list(totals):
+                if (
+                    isinstance(item, dict)
+                    and self._same_activity(
+                        item, temp_activity, project
+                    )
+                ):
+                    source = item
+                    totals.remove(item)
+                    break
+            if source is not None:
+                target = self._activity_total_entry(
+                    stats,
+                    final_activity,
+                    project,
+                    create=True,
+                )
+                if target is not None:
+                    source_seconds = max(
+                        0,
+                        int(source.get("work_seconds", 0)),
+                    )
+                    target["work_seconds"] = max(
+                        0,
+                        int(target.get("work_seconds", 0)),
+                    ) + (allocated_seconds or source_seconds)
+                    target["last_used"] = str(
+                        call_info.get("ended_at", "")
+                    )
+                    target["slack_call"] = not manual_mode
+                    target["manual_call"] = manual_mode
+                    target["call_source"] = (
+                        "manual" if manual_mode else "slack"
+                    )
+                    target["caller_name"] = caller_name
+            for event in stats.get("activities", []):
+                if not isinstance(event, dict):
+                    continue
+                if (
+                    str(event.get("slack_call_id", ""))
+                    == str(call_info.get("id", ""))
+                    or self._same_activity(
+                        event, temp_activity, project
+                    )
+                ):
+                    event["text"] = final_activity
+                    event["project"] = project
+                    event["temporary"] = False
+                    event["description"] = description
+                    event["caller_name"] = caller_name
+                    event["slack_call"] = not manual_mode
+                    event["manual_call"] = manual_mode
+                    event["call_source"] = (
+                        "manual" if manual_mode else "slack"
+                    )
+                    event["ended_at"] = str(
+                        call_info.get("ended_at", "")
+                    )
+                    event["work_seconds"] = allocated_seconds
+            stats["summary_shown"] = False
+
+        self._remember_project(project)
+        self._save_activity_log()
+        if self.summary_window and self.summary_window.get_visible():
+            self.summary_window.refresh()
+        self._update_ui()
+        return False
+
+    def test_slack_call_detection(
+        self, parent: Optional[Gtk.Window] = None
+    ) -> None:
+        self._ensure_slack_notification_monitor()
+
+        def worker() -> None:
+            detected, detail = self._detect_slack_microphone_stream()
+            GLib.idle_add(show_result, detected, detail)
+
+        def show_result(detected: bool, detail: str) -> bool:
+            if detected:
+                title = "Chiamata Slack rilevata"
+                message = (
+                    "Il flusso microfono di Slack è attivo. "
+                    + detail
+                )
+            else:
+                title = "Nessuna chiamata Slack rilevata"
+                message = detail
+            caller_name = self._pending_slack_caller_name()
+            if caller_name:
+                message += f"\nNome chiamante rilevato: {caller_name}."
+            elif self.settings.slack_call_detect_caller_name:
+                notification_detail = (
+                    self.slack_call_last_notification_detail
+                    or "nessuna notifica di chiamata Slack acquisita"
+                )
+                message += (
+                    "\nNome chiamante non disponibile. Dettaglio notifiche: "
+                    + notification_detail
+                )
+            alert = AlertWindow(title, message, "OK")
+            if parent:
+                try:
+                    alert.set_transient_for(parent)
+                except Exception:
+                    pass
+            return False
+
+        threading.Thread(target=worker, daemon=True).start()
+
 
     def _setup_indicator_or_control(self) -> None:
         if Indicator is not None:
@@ -3828,6 +5267,27 @@ class WorkBreakApp:
         )
         activity_item.connect("activate", lambda *_: self.request_activity_prompt())
         menu.append(activity_item)
+
+        if self.slack_call_tracking_active:
+            stop_call = Gtk.MenuItem(
+                label=(
+                    "Termina modalità chiamata"
+                    if self.slack_call_manual_mode
+                    else "Termina timer chiamata Slack adesso"
+                )
+            )
+            stop_call.connect(
+                "activate", lambda *_: self._finish_slack_call_tracking()
+            )
+            menu.append(stop_call)
+        else:
+            start_call = Gtk.MenuItem(
+                label="Avvia modalità chiamata manuale"
+            )
+            start_call.connect(
+                "activate", lambda *_: self._start_manual_call_tracking()
+            )
+            menu.append(start_call)
 
         if (
             self.day_suspended
@@ -3915,6 +5375,12 @@ class WorkBreakApp:
         return pending
 
     def _refresh_google_backup_settings_ui(self) -> None:
+        # Qualunque risultato proveniente dai worker di backup deve rientrare
+        # nel thread GTK prima di toccare widget o finestre. Aggiornare GTK da
+        # un thread secondario può lasciare la finestra Impostazioni congelata.
+        if threading.get_ident() != self._gtk_thread_id:
+            GLib.idle_add(self._refresh_google_backup_settings_ui)
+            return
         if self.settings_window and self.settings_window.get_visible():
             try:
                 self.settings_window.refresh_backup_ui()
@@ -3986,17 +5452,20 @@ class WorkBreakApp:
             local_backup_last_error="",
         )
         self._backup_attempted_targets.clear()
-        success, message = self.backup_data(
+        def completed(success: bool, message: str) -> None:
+            self._show_backup_message(
+                parent,
+                "Cartella locale configurata" if success else "Ci sono stati problemi",
+                message,
+                error=not success,
+            )
+
+        self.backup_data_async(
             manual=True,
             parent=parent,
             notify=False,
             targets={"local"},
-        )
-        self._show_backup_message(
-            parent,
-            "Cartella locale configurata" if success else "Ci sono stati problemi",
-            message,
-            error=not success,
+            on_complete=completed,
         )
 
     @staticmethod
@@ -4007,36 +5476,119 @@ class WorkBreakApp:
             and "/gvfs/google-drive:" in normalized
         )
 
+    @staticmethod
+    def _variant_value(value: object, default: object = "") -> object:
+        try:
+            return value.unpack()  # type: ignore[attr-defined]
+        except Exception:
+            return default if value is None else value
+
+    def _google_drive_goa_accounts(self) -> list[tuple[str, str]]:
+        """Legge gli account con servizio File direttamente da GNOME Online Accounts."""
+        accounts: list[tuple[str, str]] = []
+        try:
+            connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            result = connection.call_sync(
+                "org.gnome.OnlineAccounts",
+                "/org/gnome/OnlineAccounts",
+                "org.freedesktop.DBus.ObjectManager",
+                "GetManagedObjects",
+                None,
+                GLib.VariantType.new("(a{oa{sa{sv}}})"),
+                Gio.DBusCallFlags.NONE,
+                5000,
+                None,
+            )
+            managed_objects = result.unpack()[0]
+            for interfaces in managed_objects.values():
+                account = interfaces.get("org.gnome.OnlineAccounts.Account")
+                files = interfaces.get("org.gnome.OnlineAccounts.Files")
+                if not account or not files:
+                    continue
+                provider = str(
+                    self._variant_value(account.get("ProviderType"), "") or ""
+                ).lower()
+                files_disabled = bool(
+                    self._variant_value(account.get("FilesDisabled"), False)
+                )
+                uri = str(self._variant_value(files.get("Uri"), "") or "")
+                if provider != "google" or files_disabled or not self._is_google_drive_uri(uri):
+                    continue
+                name = str(
+                    self._variant_value(account.get("PresentationIdentity"), "")
+                    or self._variant_value(account.get("Identity"), "")
+                    or "Google Drive"
+                )
+                accounts.append((name, uri))
+        except Exception:
+            # GNOME Online Accounts può non essere disponibile su desktop non GNOME.
+            pass
+        return accounts
+
     def _google_drive_mounts(self) -> list[tuple[str, str]]:
-        mounts: list[tuple[str, str]] = []
+        accounts: list[tuple[str, str]] = []
         seen: set[str] = set()
+
+        def add_account(name: str, uri: str) -> None:
+            normalized = str(uri or "").strip()
+            if not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            accounts.append((str(name or "Google Drive"), normalized))
+
+        # Prima recupera gli account configurati, anche se Nautilus non li ha
+        # ancora montati nella sessione corrente.
+        for name, uri in self._google_drive_goa_accounts():
+            add_account(name, uri)
+
         try:
             monitor = Gio.VolumeMonitor.get()
             for mount in monitor.get_mounts():
                 root = mount.get_root()
                 uri = root.get_uri() if root else ""
                 name = str(mount.get_name() or "Google Drive")
-                if self._is_google_drive_uri(uri) and uri not in seen:
-                    seen.add(uri)
-                    mounts.append((name, uri))
+                if self._is_google_drive_uri(uri):
+                    add_account(name, uri)
         except Exception:
             pass
 
-        # Alcune versioni di GVFS non espongono subito il mount al VolumeMonitor,
-        # pur rendendolo già disponibile nel filesystem della sessione utente.
+        # Fallback per versioni di GVFS che espongono solo il mount FUSE.
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
         gvfs_dir = Path(runtime_dir) / "gvfs"
         try:
             for item in gvfs_dir.iterdir():
                 if not item.name.startswith("google-drive:"):
                     continue
-                uri = item.resolve().as_uri()
-                if uri not in seen:
-                    seen.add(uri)
-                    mounts.append(("Google Drive", uri))
+                add_account("Google Drive", item.resolve().as_uri())
         except Exception:
             pass
-        return mounts
+        return accounts
+
+    @staticmethod
+    def _mount_google_drive_uri(account_uri: str) -> str:
+        """Tenta il montaggio tramite GIO e restituisce l'eventuale dettaglio."""
+        gio_command = shutil.which("gio")
+        if not gio_command:
+            return "Comando gio non disponibile (pacchetto libglib2.0-bin)."
+        try:
+            result = subprocess.run(
+                [gio_command, "mount", account_uri],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=45,
+                check=False,
+                env=WorkBreakApp._clean_subprocess_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return "Il montaggio di Google Drive non ha risposto entro 45 secondi."
+        except Exception as exc:
+            return str(exc)
+
+        detail = (result.stderr or result.stdout or "").strip()
+        if result.returncode == 0 or "already mounted" in detail.lower():
+            return ""
+        return detail or f"gio mount terminato con codice {result.returncode}."
 
     def _show_backup_message(
         self,
@@ -4063,8 +5615,9 @@ class WorkBreakApp:
             self._show_backup_message(
                 parent,
                 "Gestione account non disponibile",
-                "Account online di GNOME non è installato. Puoi comunque scegliere "
-                "una cartella locale sincronizzata con Google Drive.",
+                "Account online di GNOME non è installato. Il backup locale resta "
+                "comunque disponibile; per il file remoto installa GNOME Online "
+                "Accounts e GVFS.",
                 error=True,
             )
             return
@@ -4074,6 +5627,7 @@ class WorkBreakApp:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=self._clean_subprocess_env(),
             )
         except Exception as exc:
             self._show_backup_message(
@@ -4086,88 +5640,134 @@ class WorkBreakApp:
     def configure_google_drive_backup(
         self, parent: Optional[Gtk.Window] = None
     ) -> None:
-        # Non apriamo automaticamente “Aggiungi account”: l'account potrebbe
-        # esistere già ma non essere ancora elencato dal VolumeMonitor.
-        settings = Settings.load()
         mounts = self._google_drive_mounts()
-        initial_uri = settings.google_drive_backup_folder_uri
-        if not initial_uri and mounts:
-            initial_uri = mounts[0][1]
-        self._choose_google_drive_folder(parent, initial_uri)
-
-    def _choose_google_drive_folder(
-        self,
-        parent: Optional[Gtk.Window],
-        initial_uri: str = "",
-    ) -> None:
-        dialog = Gtk.FileChooserDialog(
-            title="Scegli Google Drive o una cartella sincronizzata",
-            parent=parent,
-            action=Gtk.FileChooserAction.SELECT_FOLDER,
-        )
-        dialog.add_buttons(
-            "Annulla",
-            Gtk.ResponseType.CANCEL,
-            "Usa questa cartella",
-            Gtk.ResponseType.OK,
-        )
-        dialog.set_local_only(False)
-        dialog.set_create_folders(True)
-        if initial_uri:
-            try:
-                dialog.set_current_folder_uri(initial_uri)
-            except Exception:
-                pass
-        response = dialog.run()
-        uri = dialog.get_uri() if response == Gtk.ResponseType.OK else ""
-        selected_name = dialog.get_filename() or ""
-        dialog.destroy()
-        if not uri:
-            return
-
-        display_name = ""
-        try:
-            folder = Gio.File.new_for_uri(uri)
-            info = folder.query_info(
-                "standard::display-name,standard::type,access::can-write",
-                Gio.FileQueryInfoFlags.NONE,
-                None,
-            )
-            if info.get_file_type() != Gio.FileType.DIRECTORY:
-                raise ValueError("La selezione non è una cartella")
-            if (
-                info.has_attribute("access::can-write")
-                and not info.get_attribute_boolean("access::can-write")
-            ):
-                raise PermissionError("La cartella risulta in sola lettura")
-            display_name = str(info.get_display_name() or "")
-        except Exception as exc:
+        if not mounts:
             self._show_backup_message(
                 parent,
-                "Ci sono stati problemi",
-                f"La cartella selezionata non è accessibile: {exc}",
+                "Google Drive non disponibile",
+                (
+                    "Non risulta alcun account Google con il servizio File attivo "
+                    "nella sessione GNOME. Apri Account online, seleziona l’account "
+                    "Google e verifica che File sia abilitato. Non aggiungere un "
+                    "duplicato dell’account già presente."
+                ),
                 error=True,
             )
             return
 
+        if len(mounts) == 1:
+            name, uri = mounts[0]
+            self._configure_google_drive_account(parent, name, uri)
+            return
+
+        dialog = Gtk.Dialog(
+            title="Scegli l’account Google Drive",
+            transient_for=parent,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+        dialog.add_button("Annulla", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Usa questo account", Gtk.ResponseType.OK)
+        content = dialog.get_content_area()
+        content.set_spacing(10)
+        content.set_border_width(14)
+        info = Gtk.Label(
+            label=(
+                "Scegli l’account. WorkBreak Guard aggiornerà soltanto il file "
+                f"{GOOGLE_DRIVE_BACKUP_FILENAME} nella radice del Drive."
+            )
+        )
+        info.set_xalign(0)
+        info.set_line_wrap(True)
+        content.pack_start(info, False, False, 0)
+        combo = Gtk.ComboBoxText()
+        for index, (name, uri) in enumerate(mounts):
+            label = name or "Google Drive"
+            if uri and uri not in label:
+                label = f"{label} — {uri}"
+            combo.append(str(index), label)
+        combo.set_active(0)
+        content.pack_start(combo, False, False, 0)
+        dialog.show_all()
+        response = dialog.run()
+        selected = combo.get_active_id() if response == Gtk.ResponseType.OK else ""
+        dialog.destroy()
+        if selected is None or selected == "":
+            return
+        try:
+            name, uri = mounts[int(selected)]
+        except Exception:
+            return
+        self._configure_google_drive_account(parent, name, uri)
+
+    def _configure_google_drive_account(
+        self,
+        parent: Optional[Gtk.Window],
+        account_name: str,
+        account_uri: str,
+    ) -> None:
+        root = Gio.File.new_for_uri(account_uri)
+        first_error = ""
+        try:
+            info = root.query_info(
+                "standard::display-name,standard::type",
+                Gio.FileQueryInfoFlags.NONE,
+                None,
+            )
+        except Exception as exc:
+            first_error = str(exc)
+            mount_error = self._mount_google_drive_uri(account_uri)
+            try:
+                info = root.query_info(
+                    "standard::display-name,standard::type",
+                    Gio.FileQueryInfoFlags.NONE,
+                    None,
+                )
+            except Exception as retry_exc:
+                details = mount_error or str(retry_exc) or first_error
+                self._show_backup_message(
+                    parent,
+                    "Account Google Drive non accessibile",
+                    (
+                        "L’account è stato trovato, ma il servizio File non può "
+                        "essere montato. Verifica in Account online che File sia "
+                        "attivo e che l’account non richieda nuovamente l’accesso. "
+                        f"Dettaglio: {details}"
+                    ),
+                    error=True,
+                )
+                return
+
+        if info.get_file_type() != Gio.FileType.DIRECTORY:
+            self._show_backup_message(
+                parent,
+                "Account Google Drive non accessibile",
+                "La destinazione restituita da GNOME non è una cartella accessibile.",
+                error=True,
+            )
+            return
+        display_name = str(info.get_display_name() or account_name or "Google Drive")
+
         self._update_persisted_backup_settings(
-            google_drive_backup_folder_uri=uri,
-            google_drive_backup_folder_name=(
-                display_name or selected_name or "Google Drive"
-            ),
+            google_drive_backup_folder_uri=account_uri,
+            google_drive_backup_folder_name=display_name,
+            google_drive_backup_single_file_configured=True,
             google_drive_backup_last_error="",
         )
         self._backup_attempted_targets.clear()
-        success, message = self.backup_data(
+        def completed(success: bool, message: str) -> None:
+            self._show_backup_message(
+                parent,
+                "Backup Google Drive configurato" if success else "Ci sono stati problemi",
+                message,
+                error=not success,
+            )
+
+        self.backup_data_async(
             manual=True,
             parent=parent,
             notify=False,
-        )
-        self._show_backup_message(
-            parent,
-            "Tutto ok, configurato" if success else "Ci sono stati problemi",
-            message,
-            error=not success,
+            targets={"google"},
+            on_complete=completed,
         )
 
     def disconnect_google_drive_backup(
@@ -4178,10 +5778,11 @@ class WorkBreakApp:
             flags=Gtk.DialogFlags.MODAL,
             message_type=Gtk.MessageType.QUESTION,
             buttons=Gtk.ButtonsType.NONE,
-            text="Scollegare la seconda copia Google Drive?",
+            text="Scollegare il file di backup Google Drive?",
         )
         dialog.format_secondary_text(
-            "I backup già presenti su Drive non verranno cancellati. "
+            f"Il file {GOOGLE_DRIVE_BACKUP_FILENAME} già presente su Drive "
+            "non verrà cancellato. "
             "Il backup locale e la sua pianificazione resteranno attivi."
         )
         dialog.add_button("Annulla", Gtk.ResponseType.CANCEL)
@@ -4193,6 +5794,7 @@ class WorkBreakApp:
         self._update_persisted_backup_settings(
             google_drive_backup_folder_uri="",
             google_drive_backup_folder_name="",
+            google_drive_backup_single_file_configured=False,
             google_drive_backup_last_success_at="",
             google_drive_backup_last_error="",
             google_drive_backup_last_auto_key="",
@@ -4239,26 +5841,171 @@ class WorkBreakApp:
         return self._build_backup_payload(backup_type)
 
     @staticmethod
-    def _copy_local_file_to_gio(source_path: Path, destination: Gio.File) -> None:
-        source = Gio.File.new_for_path(str(source_path))
-        source.copy(
-            destination,
-            Gio.FileCopyFlags.OVERWRITE,
-            None,
-            None,
-            None,
-        )
+    def _is_gio_error(exc: Exception, code: Gio.IOErrorEnum) -> bool:
+        try:
+            return isinstance(exc, GLib.Error) and exc.matches(
+                Gio.io_error_quark(), code
+            )
+        except Exception:
+            return False
+
+    @classmethod
+    def _delete_gio_file_if_present(cls, destination: Gio.File) -> None:
+        try:
+            destination.delete(None)
+        except Exception as exc:
+            if cls._is_gio_error(exc, Gio.IOErrorEnum.NOT_FOUND):
+                return
+            raise
 
     @staticmethod
-    def _copy_gio_file_to_local(source: Gio.File, destination_path: Path) -> None:
-        destination = Gio.File.new_for_path(str(destination_path))
-        source.copy(
-            destination,
-            Gio.FileCopyFlags.OVERWRITE,
-            None,
-            None,
-            None,
+    def _run_gio_transfer_helper(
+        mode: str,
+        source: str,
+        destination: str,
+        timeout_seconds: int = 45,
+    ) -> None:
+        """Esegue il trasferimento GVfs fuori dal processo GTK.
+
+        Alcuni backend Google Drive possono restare bloccati dentro una chiamata
+        GIO sincrona. Il processo separato permette di imporre un timeout reale:
+        anche in caso di mount GVfs non responsivo l'interfaccia continua a
+        funzionare e il helper viene terminato.
+        """
+        helper = r"""
+import os
+import sys
+
+import gi
+from gi.repository import Gio, GLib
+
+
+def fail(message):
+    print(str(message), file=sys.stderr)
+    raise SystemExit(2)
+
+
+def write_remote(local_path, remote_uri):
+    destination = Gio.File.new_for_uri(remote_uri)
+    try:
+        destination.delete(None)
+    except Exception as exc:
+        try:
+            missing = isinstance(exc, GLib.Error) and exc.matches(
+                Gio.io_error_quark(), Gio.IOErrorEnum.NOT_FOUND
+            )
+        except Exception:
+            missing = False
+        if not missing:
+            raise
+
+    stream = destination.create(Gio.FileCreateFlags.NONE, None)
+    closed = False
+    try:
+        with open(local_path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                offset = 0
+                while offset < len(chunk):
+                    written = stream.write(chunk[offset:], None)
+                    if not written:
+                        raise OSError("Google Drive non ha accettato altri dati")
+                    offset += int(written)
+        stream.flush(None)
+        stream.close(None)
+        closed = True
+    finally:
+        if not closed:
+            try:
+                stream.close(None)
+            except Exception:
+                pass
+
+
+def read_remote(remote_uri, local_path):
+    source = Gio.File.new_for_uri(remote_uri)
+    stream = source.read(None)
+    try:
+        with open(local_path, "wb") as handle:
+            while True:
+                block = stream.read_bytes(1024 * 1024, None)
+                data = bytes(block.get_data())
+                if not data:
+                    break
+                handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        try:
+            stream.close(None)
+        except Exception:
+            pass
+
+
+try:
+    operation, first, second = sys.argv[1:4]
+    if operation == "write":
+        write_remote(first, second)
+    elif operation == "read":
+        read_remote(first, second)
+    else:
+        fail("Operazione helper non valida")
+except BaseException as exc:
+    if isinstance(exc, SystemExit):
+        raise
+    fail(exc)
+"""
+        python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
+        try:
+            result = subprocess.run(
+                [python, "-I", "-c", helper, mode, source, destination],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=max(5, int(timeout_seconds)),
+                check=False,
+                env=WorkBreakApp._clean_subprocess_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"Google Drive non ha risposto entro {timeout_seconds} secondi"
+            ) from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                detail or f"Helper Google Drive terminato con codice {result.returncode}"
+            )
+
+    @classmethod
+    def _copy_local_file_to_gio(
+        cls, source_path: Path, destination: Gio.File
+    ) -> None:
+        cls._run_gio_transfer_helper(
+            "write",
+            str(source_path),
+            destination.get_uri(),
         )
+
+    @classmethod
+    def _copy_gio_file_to_local(
+        cls, source: Gio.File, destination_path: Path
+    ) -> None:
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = destination_path.with_name(destination_path.name + ".tmp")
+        try:
+            cls._run_gio_transfer_helper(
+                "read",
+                source.get_uri(),
+                str(temp),
+            )
+            temp.replace(destination_path)
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _current_backup_schedule_key(
         self, now: Optional[dt.datetime] = None
@@ -4290,7 +6037,7 @@ class WorkBreakApp:
         if "not mounted" in lowered or "mount" in lowered:
             return (
                 "Google Drive non è montato. Apri File → Altre posizioni e accedi "
-                "al Drive già collegato, poi scegli nuovamente la cartella."
+                "al Drive già collegato, poi riconfigura l’account nell’app."
             )
         if (
             "permission" in lowered
@@ -4298,12 +6045,128 @@ class WorkBreakApp:
             or "sola lettura" in lowered
         ):
             return (
-                "Google Drive non consente di scrivere nella cartella scelta. "
-                "Seleziona un'altra cartella o verifica i permessi."
+                "Google Drive non consente di aggiornare il file di backup. "
+                "Verifica che l’account sia accessibile e non in sola lettura."
             )
-        if "timed out" in lowered or "timeout" in lowered:
+        if (
+            "timed out" in lowered
+            or "timeout" in lowered
+            or "non ha risposto" in lowered
+        ):
             return "Connessione a Google Drive scaduta. Controlla Internet e riprova."
+        if (
+            "not supported" in lowered
+            or "non supportata (15)" in lowered
+            or "not-supported" in lowered
+        ):
+            return (
+                "Il backend Google Drive di GNOME ha rifiutato l’operazione di "
+                "scrittura. Riconfigura l’account nell’app e riprova; se persiste, "
+                "apri una volta Google Drive in File per rinnovare il mount GVfs."
+            )
         return f"Backup Google Drive non riuscito: {text}"
+
+    def _reserve_backup_slot(self) -> bool:
+        with self._backup_state_lock:
+            if self._backup_busy:
+                return False
+            self._backup_busy = True
+            return True
+
+    def _release_backup_slot(self) -> None:
+        with self._backup_state_lock:
+            self._backup_busy = False
+
+    def _finish_backup_async(
+        self,
+        success: bool,
+        message: str,
+        parent: Optional[Gtk.Window],
+        notify: bool,
+        on_complete: Optional[Callable[[bool, str], None]],
+    ) -> bool:
+        # Questa callback gira sempre nel main loop GTK.
+        safe_parent = parent
+        if safe_parent is not None:
+            try:
+                if not safe_parent.get_visible():
+                    safe_parent = None
+            except Exception:
+                safe_parent = None
+        if notify:
+            has_valid_copy = "Backup creato correttamente:" in message
+            self._show_backup_message(
+                safe_parent,
+                (
+                    "Backup completato"
+                    if success
+                    else (
+                        "Backup locale completato con avvisi"
+                        if has_valid_copy
+                        else "Ci sono stati problemi"
+                    )
+                ),
+                message,
+                error=not has_valid_copy,
+            )
+        if on_complete is not None:
+            try:
+                on_complete(success, message)
+            except Exception:
+                pass
+        self._refresh_google_backup_settings_ui()
+        return False
+
+    def backup_data_async(
+        self,
+        manual: bool = False,
+        parent: Optional[Gtk.Window] = None,
+        notify: bool = False,
+        targets: Optional[set[str]] = None,
+        on_complete: Optional[Callable[[bool, str], None]] = None,
+    ) -> bool:
+        """Avvia il backup senza bloccare il main loop GTK."""
+        if not self._reserve_backup_slot():
+            message = "Un backup è già in corso."
+            if notify:
+                self._show_backup_message(parent, "Backup già in corso", message)
+            return False
+
+        def worker() -> None:
+            try:
+                success, message = self.backup_data(
+                    manual=manual,
+                    parent=None,
+                    notify=False,
+                    targets=set(targets or ()),
+                    _slot_reserved=True,
+                )
+            except Exception as exc:
+                self._release_backup_slot()
+                success = False
+                message = f"Backup non riuscito: {exc}"
+            GLib.idle_add(
+                self._finish_backup_async,
+                success,
+                message,
+                parent,
+                notify,
+                on_complete,
+            )
+
+        try:
+            threading.Thread(
+                target=worker,
+                name="workbreak-guard-backup",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self._release_backup_slot()
+            message = f"Impossibile avviare il backup: {exc}"
+            if notify:
+                self._show_backup_message(parent, "Ci sono stati problemi", message, error=True)
+            return False
+        return True
 
     def backup_data(
         self,
@@ -4311,8 +6174,9 @@ class WorkBreakApp:
         parent: Optional[Gtk.Window] = None,
         notify: bool = False,
         targets: Optional[set[str]] = None,
+        _slot_reserved: bool = False,
     ) -> tuple[bool, str]:
-        if self._backup_busy:
+        if not _slot_reserved and not self._reserve_backup_slot():
             message = "Un backup è già in corso."
             if notify:
                 self._show_backup_message(parent, "Backup già in corso", message)
@@ -4338,9 +6202,9 @@ class WorkBreakApp:
                 self._show_backup_message(
                     parent, "Backup non configurato", message, error=True
                 )
+            self._release_backup_slot()
             return False, message
 
-        self._backup_busy = True
         temp_path: Optional[Path] = None
         successes: list[str] = []
         errors: list[str] = []
@@ -4395,14 +6259,17 @@ class WorkBreakApp:
                         raise ValueError(
                             "La destinazione Google Drive non è una cartella"
                         )
-                    destination = folder.get_child(filename)
+                    destination = folder.get_child(
+                        GOOGLE_DRIVE_BACKUP_FILENAME
+                    )
                     self._copy_local_file_to_gio(temp_path, destination)
                     successes.append(
-                        "copia Google Drive: "
+                        "file Google Drive aggiornato: "
                         + (
                             settings.google_drive_backup_folder_name
                             or settings.google_drive_backup_folder_uri
                         )
+                        + f"/{GOOGLE_DRIVE_BACKUP_FILENAME}"
                     )
                     updates.update(
                         google_drive_backup_last_success_at=now_text,
@@ -4470,7 +6337,7 @@ class WorkBreakApp:
                 )
             return False, message
         finally:
-            self._backup_busy = False
+            self._release_backup_slot()
             if temp_path is not None:
                 try:
                     temp_path.unlink(missing_ok=True)
@@ -4533,7 +6400,14 @@ class WorkBreakApp:
             targets.add("google")
             self._backup_attempted_targets.add(google_attempt)
         if targets:
-            self.backup_data(manual=False, notify=False, targets=targets)
+            started = self.backup_data_async(
+                manual=False,
+                notify=False,
+                targets=targets,
+            )
+            if not started:
+                for target in targets:
+                    self._backup_attempted_targets.discard(f"{target}:{key}")
 
     def _check_scheduled_google_drive_backup(self, now: dt.datetime) -> None:
         self._check_scheduled_backup(now)
@@ -4599,6 +6473,7 @@ class WorkBreakApp:
             "google_drive_backup_frequency",
             "google_drive_backup_folder_uri",
             "google_drive_backup_folder_name",
+            "google_drive_backup_single_file_configured",
             "google_drive_backup_last_success_at",
             "google_drive_backup_last_error",
             "google_drive_backup_last_auto_key",
@@ -4634,10 +6509,11 @@ class WorkBreakApp:
         try:
             self._remove_pid_file()
             subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "--autostart"],
+                [sys.executable, "-I", str(Path(__file__).resolve()), "--autostart"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=self._clean_subprocess_env(),
             )
         except Exception as exc:
             self._show_backup_message(
@@ -4649,43 +6525,12 @@ class WorkBreakApp:
             return
         Gtk.main_quit()
 
-    def restore_from_backup(
-        self, parent: Optional[Gtk.Window] = None
+    def _restore_from_gio_source(
+        self,
+        source: Gio.File,
+        parent: Optional[Gtk.Window],
+        source_label: str,
     ) -> None:
-        settings = Settings.load()
-        dialog = Gtk.FileChooserDialog(
-            title="Scegli il backup WorkBreak Guard da ripristinare",
-            parent=parent,
-            action=Gtk.FileChooserAction.OPEN,
-        )
-        dialog.add_buttons(
-            "Annulla",
-            Gtk.ResponseType.CANCEL,
-            "Ripristina questo backup",
-            Gtk.ResponseType.OK,
-        )
-        dialog.set_local_only(False)
-        local_folder = Path(settings.local_backup_folder).expanduser()
-        try:
-            if local_folder.exists():
-                dialog.set_current_folder(str(local_folder))
-            elif settings.google_drive_backup_folder_uri:
-                dialog.set_current_folder_uri(
-                    settings.google_drive_backup_folder_uri
-                )
-        except Exception:
-            pass
-        file_filter = Gtk.FileFilter()
-        file_filter.set_name("Backup JSON WorkBreak Guard")
-        file_filter.add_pattern("workbreak-guard-backup-*.json")
-        file_filter.add_pattern("*.json")
-        dialog.add_filter(file_filter)
-        response = dialog.run()
-        selected_uri = dialog.get_uri() if response == Gtk.ResponseType.OK else ""
-        dialog.destroy()
-        if not selected_uri:
-            return
-
         temp_path: Optional[Path] = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -4694,9 +6539,7 @@ class WorkBreakApp:
                 delete=False,
             ) as handle:
                 temp_path = Path(handle.name)
-            self._copy_gio_file_to_local(
-                Gio.File.new_for_uri(selected_uri), temp_path
-            )
+            self._copy_gio_file_to_local(source, temp_path)
             payload = self._validate_backup_payload(
                 json.loads(temp_path.read_text(encoding="utf-8"))
             )
@@ -4709,6 +6552,7 @@ class WorkBreakApp:
                 text="Ripristinare il backup selezionato?",
             )
             confirm.format_secondary_text(
+                f"Origine: {source_label}\n"
                 f"Backup creato: {created_at}\n\n"
                 "Impostazioni, attività e stato salvato verranno sostituiti. "
                 "Prima del ripristino sarà creato automaticamente un backup "
@@ -4753,10 +6597,95 @@ class WorkBreakApp:
                 except Exception:
                     pass
 
+    def restore_from_backup(
+        self, parent: Optional[Gtk.Window] = None
+    ) -> None:
+        settings = Settings.load()
+        dialog = Gtk.FileChooserDialog(
+            title="Scegli il backup WorkBreak Guard da ripristinare",
+            parent=parent,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.add_buttons(
+            "Annulla",
+            Gtk.ResponseType.CANCEL,
+            "Ripristina questo backup",
+            Gtk.ResponseType.OK,
+        )
+        dialog.set_local_only(True)
+        local_folder = Path(settings.local_backup_folder).expanduser()
+        try:
+            if local_folder.exists():
+                dialog.set_current_folder(str(local_folder))
+        except Exception:
+            pass
+        file_filter = Gtk.FileFilter()
+        file_filter.set_name("Backup JSON WorkBreak Guard")
+        file_filter.add_pattern("workbreak-guard-backup-*.json")
+        file_filter.add_pattern("*.json")
+        dialog.add_filter(file_filter)
+        response = dialog.run()
+        selected_path = (
+            dialog.get_filename() if response == Gtk.ResponseType.OK else ""
+        )
+        dialog.destroy()
+        if not selected_path:
+            return
+        self._restore_from_gio_source(
+            Gio.File.new_for_path(selected_path),
+            parent,
+            selected_path,
+        )
+
+    def restore_from_google_drive_backup(
+        self, parent: Optional[Gtk.Window] = None
+    ) -> None:
+        settings = Settings.load()
+        if not settings.google_drive_backup_folder_uri:
+            self._show_backup_message(
+                parent,
+                "Google Drive non configurato",
+                "Configura prima l’account Google Drive nelle impostazioni.",
+                error=True,
+            )
+            return
+        root = Gio.File.new_for_uri(settings.google_drive_backup_folder_uri)
+        source = root.get_child(GOOGLE_DRIVE_BACKUP_FILENAME)
+        try:
+            info = source.query_info(
+                "standard::type,standard::size",
+                Gio.FileQueryInfoFlags.NONE,
+                None,
+            )
+            if info.get_file_type() != Gio.FileType.REGULAR:
+                raise FileNotFoundError(
+                    f"{GOOGLE_DRIVE_BACKUP_FILENAME} non è un file valido"
+                )
+        except Exception as exc:
+            self._show_backup_message(
+                parent,
+                "Backup Google Drive non trovato",
+                (
+                    f"Non riesco a leggere {GOOGLE_DRIVE_BACKUP_FILENAME} "
+                    f"dall’account configurato: {exc}"
+                ),
+                error=True,
+            )
+            return
+        account = (
+            settings.google_drive_backup_folder_name
+            or settings.google_drive_backup_folder_uri
+        )
+        self._restore_from_gio_source(
+            source,
+            parent,
+            f"Google Drive — {account}/{GOOGLE_DRIVE_BACKUP_FILENAME}",
+        )
+
     def restore_from_google_drive(
         self, parent: Optional[Gtk.Window] = None
     ) -> None:
-        self.restore_from_backup(parent)
+        self.restore_from_google_drive_backup(parent)
 
     def show_day_off_manager(self) -> None:
         if self.day_off_window and self.day_off_window.get_visible():
@@ -5785,6 +7714,17 @@ class WorkBreakApp:
             return True
         self._ensure_due_balance_settlements(now.date())
         self._check_scheduled_backup(now)
+
+        if self.slack_call_tracking_active:
+            # La chiamata usa un timer separato e congela esattamente la fase
+            # precedente. La retention serve solo a confermare la chiusura e non
+            # viene sommata al tempo registrato.
+            if self.slack_call_end_missing_since is None:
+                self._record_slack_call_independent_second(now.date())
+            self.clock.hide()
+            self._save_runtime_state()
+            self._update_ui()
+            return True
 
         if not self.settings.enabled:
             # Timer e fasi restano completamente congelati finché l'utente non
@@ -6925,6 +8865,7 @@ class WorkBreakApp:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
+                    env=self._clean_subprocess_env(),
                 )
                 return
             except Exception:
@@ -7577,11 +9518,27 @@ class WorkBreakApp:
         # nuovo tetto giornaliero.
         stats["credited_break_seconds"] = self.credited_break_for_day_seconds(day, stats)
         stats["summary_shown"] = False
-        if self.current_activity:
-            item = self._activity_total_entry(stats, self.current_activity, self.current_project)
+        record_activity, record_project = self._recording_activity()
+        if record_activity:
+            item = self._activity_total_entry(
+                stats, record_activity, record_project
+            )
             if item is not None:
                 item["work_seconds"] = int(item.get("work_seconds", 0)) + seconds
                 item["last_used"] = dt.datetime.now().isoformat(timespec="seconds")
+            if (
+                self.slack_call_tracking_active
+                and record_activity == self.slack_call_temp_activity
+                and record_project == self.slack_call_project
+            ):
+                day_key = day.isoformat()
+                self.slack_call_allocations[day_key] = (
+                    max(
+                        0,
+                        int(self.slack_call_allocations.get(day_key, 0)),
+                    )
+                    + seconds
+                )
         self._refresh_closed_balance_delta(day)
         if seconds == 1:
             self._touch_stats()
@@ -8557,6 +10514,12 @@ class WorkBreakApp:
 
     def compact_indicator_label(self) -> str:
         # Il tempo resta sempre accanto all'icona quando il pannello lo supporta.
+        if self.slack_call_tracking_active:
+            elapsed = sum(
+                max(0, int(value))
+                for value in self.slack_call_allocations.values()
+            )
+            return f"☎ {format_compact_time(elapsed)}"
         if not self.settings.enabled:
             return "OFF"
         elif self.day_suspended:
@@ -8623,6 +10586,56 @@ class WorkBreakApp:
             pass
 
     def status_text(self) -> str:
+        if self.slack_call_tracking_active:
+            elapsed = sum(
+                max(0, int(value))
+                for value in self.slack_call_allocations.values()
+            )
+            project = (
+                self.slack_call_project
+                or self.settings.slack_call_default_project
+            )
+            call_title = (
+                "Modalità chiamata"
+                if self.slack_call_manual_mode
+                else "Chiamata Slack"
+            )
+            caller = (
+                f" con {self.slack_call_caller_name}"
+                if self.slack_call_caller_name
+                else ""
+            )
+            retention = ""
+            if (
+                not self.slack_call_manual_mode
+                and self.slack_call_end_missing_since is not None
+            ):
+                configured = max(
+                    0,
+                    int(self.settings.slack_call_end_retention_seconds),
+                )
+                passed = max(
+                    0,
+                    int(
+                        time.monotonic()
+                        - self.slack_call_end_missing_since
+                    ),
+                )
+                retention = (
+                    f" — chiusura tra {max(0, configured - passed)} s"
+                )
+            previous = ""
+            if self.current_activity:
+                previous_name = (
+                    f"{self.current_project} — {self.current_activity}"
+                    if self.current_project
+                    else self.current_activity
+                )
+                previous = f" — poi riprende: {previous_name}"
+            return (
+                f"{call_title}{caller} · {project} · {format_hhmmss(elapsed)}"
+                f"{retention}{previous}"
+            )
         if not self.settings.enabled:
             return "Promemoria disattivato — timer congelato"
         if self.day_suspended:
@@ -8727,6 +10740,12 @@ class WorkBreakApp:
                 pass
 
     def quit(self) -> None:
+        self._stop_slack_notification_monitor()
+        if self.slack_call_tracking_active:
+            # In chiusura non lasciare attività temporanee: consolida la chiamata
+            # con il nome generico, perché la finestra descrizione non potrebbe
+            # essere completata dopo l'uscita dal ciclo GTK.
+            self._finish_slack_call_tracking(ask_description=False)
         self._save_activity_log()
         self._save_runtime_state(force=True)
         self._remove_pid_file()
