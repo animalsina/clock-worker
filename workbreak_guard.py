@@ -49,6 +49,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import traceback
 import tempfile
 import threading
 import wave
@@ -92,6 +93,7 @@ RESTORE_SAFETY_DIR = CONFIG_DIR / "restore-safety"
 DEFAULT_LOCAL_BACKUP_DIR = CONFIG_DIR / "backups"
 GOOGLE_DRIVE_BACKUP_FILENAME = "workbreak-guard-backup.json"
 PID_FILE = CONFIG_DIR / "app.pid"
+UI_FREEZE_LOG_FILE = CONFIG_DIR / "ui-freeze.log"
 AUTOSTART_DIR = Path.home() / ".config" / "autostart"
 AUTOSTART_FILE = AUTOSTART_DIR / f"{APP_ID}.desktop"
 SESSION_END_INACTIVITY_SECONDS = 20 * 60
@@ -2043,6 +2045,7 @@ class ActivitySummaryWindow(Gtk.Window):
         self.app = app
         self.selected_day = selected_day or dt.date.today()
         self._changing_day = False
+        self._day_combo_signature: tuple[str, ...] = ()
         self.markdown_window: Optional[Gtk.Window] = None
         self.set_default_size(1180, 600)
         self.set_position(Gtk.WindowPosition.CENTER)
@@ -2070,6 +2073,14 @@ class ActivitySummaryWindow(Gtk.Window):
         today_button = Gtk.Button(label="Oggi")
         today_button.connect("clicked", lambda *_: self._set_day(dt.date.today()))
         header.pack_start(today_button, False, False, 0)
+
+        refresh_button = Gtk.Button(label="Aggiorna")
+        refresh_button.set_tooltip_text(
+            "Ricalcola manualmente riepilogo e attività. L'aggiornamento completo "
+            "non viene eseguito ogni pochi secondi per non rallentare l'interfaccia."
+        )
+        refresh_button.connect("clicked", lambda *_: self.refresh())
+        header.pack_start(refresh_button, False, False, 0)
 
         next_button = Gtk.Button(label="Giorno successivo ›")
         next_button.connect("clicked", lambda *_: self._move_day(1))
@@ -2168,20 +2179,26 @@ class ActivitySummaryWindow(Gtk.Window):
             return
         self.refresh()
 
-    def _reload_day_combo(self) -> None:
-        self._changing_day = True
-        self.day_combo.remove_all()
+    def _reload_day_combo(self, force: bool = False) -> None:
         stored_days = set(self.app.activity_log.get("days", {}).keys())
         stored_days.add(dt.date.today().isoformat())
         stored_days.add(self.selected_day.isoformat())
-        for day_key in sorted(stored_days, reverse=True):
-            try:
-                day = dt.date.fromisoformat(day_key)
-            except Exception:
-                continue
-            self.day_combo.append(day_key, day.strftime("%d/%m/%Y"))
-        self.day_combo.set_active_id(self.selected_day.isoformat())
-        self._changing_day = False
+        ordered_days = tuple(sorted(stored_days, reverse=True))
+
+        self._changing_day = True
+        try:
+            if force or ordered_days != self._day_combo_signature:
+                self.day_combo.remove_all()
+                for day_key in ordered_days:
+                    try:
+                        day = dt.date.fromisoformat(day_key)
+                    except Exception:
+                        continue
+                    self.day_combo.append(day_key, day.strftime("%d/%m/%Y"))
+                self._day_combo_signature = ordered_days
+            self.day_combo.set_active_id(self.selected_day.isoformat())
+        finally:
+            self._changing_day = False
 
     def _selected_row(self) -> Optional[dict]:
         model, tree_iter = self.tree.get_selection().get_selected()
@@ -2420,8 +2437,9 @@ class ActivitySummaryWindow(Gtk.Window):
             self.markdown_window.destroy()
         self.markdown_window = MarkdownPreviewWindow(self, markdown_text)
 
-    def refresh(self) -> None:
-        self._reload_day_combo()
+    def refresh(self, reload_days: bool = True) -> None:
+        if reload_days:
+            self._reload_day_combo()
         stats = self.app.activity_log.get("days", {}).get(
             self.selected_day.isoformat(),
             {
@@ -4063,7 +4081,22 @@ class WorkBreakApp:
         self.beep_file = self._build_sound_file("soft")
         self._backup_busy = False
         self._backup_state_lock = threading.Lock()
+        self._google_drive_discovery_busy = False
+        self._google_drive_probe_busy = False
+        self._google_restore_busy = False
         self._gtk_thread_id = threading.get_ident()
+        self._message_dialogs: list[Gtk.MessageDialog] = []
+        self._next_balance_maintenance_monotonic = 0.0
+        self._activity_save_idle_id = 0
+        self._cached_daily_progress_day: Optional[dt.date] = None
+        self._cached_daily_progress_text = ""
+        self._next_daily_progress_refresh_monotonic = 0.0
+        self._cached_indicator_suffix_day: Optional[dt.date] = None
+        self._cached_indicator_suffix = ""
+        self._next_indicator_suffix_refresh_monotonic = 0.0
+        self._ui_heartbeat_monotonic = time.monotonic()
+        self._ui_watchdog_last_report_monotonic = 0.0
+        self._ui_watchdog_stop = threading.Event()
         self._restored_data_pending_restart = False
         self._backup_attempted_targets: set[str] = set()
         self._backup_next_check_monotonic = 0.0
@@ -4104,6 +4137,13 @@ class WorkBreakApp:
             self._sync_session(now, force=True)
         GLib.timeout_add_seconds(1, self.tick)
         GLib.timeout_add_seconds(1, self._schedule_slack_call_detection)
+        GLib.timeout_add(250, self._ui_heartbeat)
+        self._ui_watchdog_thread = threading.Thread(
+            target=self._ui_watchdog_worker,
+            daemon=True,
+            name="workbreak-guard-ui-watchdog",
+        )
+        self._ui_watchdog_thread.start()
         self._ensure_slack_notification_monitor()
         GLib.idle_add(self._show_pending_summary_if_needed)
         signal.signal(signal.SIGINT, lambda *_: self.quit())
@@ -4132,6 +4172,48 @@ class WorkBreakApp:
         # I signal Python possono arrivare fuori dal ciclo GTK: rimandiamo l'apertura
         # della finestra al main loop per evitare accessi concorrenti alla UI.
         GLib.idle_add(self.request_activity_prompt)
+
+    def _ui_heartbeat(self) -> bool:
+        self._ui_heartbeat_monotonic = time.monotonic()
+        return not self._ui_watchdog_stop.is_set()
+
+    def _ui_watchdog_worker(self) -> None:
+        """Registra lo stack del thread GTK quando il main loop resta fermo.
+
+        Il watchdog non tocca mai GTK dal thread secondario. Serve sia come rete
+        di sicurezza sia per distinguere un vero blocco del main loop da una
+        finestra modale rimasta sopra o dietro ad altre finestre.
+        """
+        while not self._ui_watchdog_stop.wait(1.0):
+            now_mono = time.monotonic()
+            lag = now_mono - self._ui_heartbeat_monotonic
+            if lag < 2.5:
+                continue
+            if now_mono - self._ui_watchdog_last_report_monotonic < 10.0:
+                continue
+            self._ui_watchdog_last_report_monotonic = now_mono
+            frame = sys._current_frames().get(self._gtk_thread_id)
+            if frame is None:
+                continue
+            try:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                stack = "".join(traceback.format_stack(frame))
+                with UI_FREEZE_LOG_FILE.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        "\n=== UI freeze rilevato "
+                        + dt.datetime.now().astimezone().isoformat(timespec="seconds")
+                        + f" · main loop fermo da {lag:.1f}s ===\n"
+                    )
+                    handle.write(
+                        "backup_busy=" + str(self._backup_busy)
+                        + " slack_detection_busy=" + str(self._slack_detection_busy)
+                        + " slack_call_active=" + str(self.slack_call_tracking_active)
+                        + "\n"
+                    )
+                    handle.write(stack)
+                    handle.write("=== fine stack ===\n")
+            except Exception:
+                pass
 
     @staticmethod
     def _clean_subprocess_env() -> dict[str, str]:
@@ -4725,8 +4807,15 @@ class WorkBreakApp:
                                     or "Slack"
                                 )
                                 return True, f"pactl: {name}"
-                    pactl_error = (
-                        "pactl disponibile: nessun flusso microfono Slack"
+                    # pactl ha risposto correttamente: l'assenza di un flusso
+                    # Slack è un risultato definitivo. Non eseguire anche
+                    # pw-dump a ogni controllo: il dump dell'intero grafo
+                    # PipeWire può essere molto grande e la decodifica JSON
+                    # ripetuta ogni pochi secondi sottraeva il GIL al main loop
+                    # GTK, congelando tutte le finestre.
+                    return (
+                        False,
+                        "pactl disponibile: nessun flusso microfono Slack",
                     )
                 else:
                     pactl_error = "pactl: output non leggibile"
@@ -4737,51 +4826,70 @@ class WorkBreakApp:
 
         pw_dump = shutil.which("pw-dump")
         if pw_dump:
+            # Il grafo PipeWire può contenere molti megabyte. La decodifica e
+            # json.loads vengono eseguiti in un processo Python separato, non
+            # nel processo GTK: anche sui sistemi senza pactl il fallback non
+            # può più trattenere il GIL dell'interfaccia.
+            helper = r"""
+import json
+import subprocess
+import sys
+
+pw_dump = sys.argv[1]
+result = subprocess.run(
+    [pw_dump],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    timeout=2.5,
+    check=False,
+)
+if result.returncode != 0 or not result.stdout.strip():
+    raise SystemExit(3)
+payload = json.loads(result.stdout.decode("utf-8", errors="replace"))
+for item in payload if isinstance(payload, list) else []:
+    if not isinstance(item, dict):
+        continue
+    info = item.get("info", {})
+    props = info.get("props", {}) if isinstance(info, dict) else {}
+    if not isinstance(props, dict):
+        continue
+    media_class = str(props.get("media.class", "")).casefold()
+    text = " ".join(f"{key}={value}" for key, value in props.items()).casefold()
+    if "slack" not in text:
+        continue
+    if not any(token in media_class for token in (
+        "stream/input/audio", "audio/source", "input"
+    )):
+        continue
+    name = str(props.get("application.name", "") or props.get("node.name", "") or "Slack")
+    print("1\t" + name.replace("\n", " "))
+    raise SystemExit(0)
+print("0")
+"""
+            python = (
+                "/usr/bin/python3"
+                if Path("/usr/bin/python3").exists()
+                else sys.executable
+            )
             try:
                 result = subprocess.run(
-                    [pw_dump],
+                    [python, "-I", "-c", helper, pw_dump],
                     capture_output=True,
                     text=True,
-                    timeout=2.5,
+                    timeout=4.0,
                     check=False,
                     env=self._clean_subprocess_env(),
                 )
-                if result.returncode == 0 and result.stdout.strip():
-                    payload = json.loads(result.stdout)
-                    if isinstance(payload, list):
-                        for item in payload:
-                            if not isinstance(item, dict):
-                                continue
-                            info = item.get("info", {})
-                            props = (
-                                info.get("props", {})
-                                if isinstance(info, dict)
-                                else {}
-                            )
-                            if not isinstance(props, dict):
-                                continue
-                            media_class = str(
-                                props.get("media.class", "")
-                            ).casefold()
-                            text = self._slack_props_text(props)
-                            if (
-                                "slack" in text
-                                and (
-                                    "stream/input/audio" in media_class
-                                    or "audio/source" in media_class
-                                    or "input" in media_class
-                                )
-                            ):
-                                name = (
-                                    str(props.get("application.name", ""))
-                                    or str(props.get("node.name", ""))
-                                    or "Slack"
-                                )
-                                return True, f"pw-dump: {name}"
+                output = (result.stdout or "").strip()
+                if result.returncode == 0 and output.startswith("1\t"):
+                    return True, f"pw-dump: {output.split(chr(9), 1)[1] or 'Slack'}"
+                if result.returncode == 0 and output == "0":
                     return (
                         False,
                         "pw-dump disponibile: nessun flusso microfono Slack",
                     )
+                detail = (result.stderr or output or "output non leggibile").strip()
+                raise RuntimeError(detail)
             except Exception as exc:
                 return (
                     False,
@@ -4813,14 +4921,22 @@ class WorkBreakApp:
         self._slack_detection_busy = True
 
         def worker() -> None:
-            detected, detail = self._detect_slack_microphone_stream()
+            try:
+                detected, detail = self._detect_slack_microphone_stream()
+            except Exception as exc:
+                detected = False
+                detail = f"Rilevamento Slack non riuscito: {exc}"
             GLib.idle_add(
                 self._apply_slack_call_detection,
                 detected,
                 detail,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="wbg-slack-detection",
+        ).start()
         return True
 
     def _apply_slack_call_detection(
@@ -5597,16 +5713,42 @@ class WorkBreakApp:
         message: str,
         error: bool = False,
     ) -> None:
+        # Non usare dialog.run(): un risultato di backup può arrivare da un
+        # worker mentre è aperta un'altra finestra. I main loop annidati e la
+        # modalità transiente potevano lasciare una finestra invisibile attiva
+        # e far sembrare bloccati tutti gli altri controlli.
+        safe_parent = parent
+        if safe_parent is not None:
+            try:
+                if not safe_parent.get_visible():
+                    safe_parent = None
+            except Exception:
+                safe_parent = None
         dialog = Gtk.MessageDialog(
-            transient_for=parent,
-            flags=Gtk.DialogFlags.MODAL,
+            transient_for=safe_parent,
+            flags=Gtk.DialogFlags.MODAL if safe_parent else Gtk.DialogFlags.DESTROY_WITH_PARENT,
             message_type=(Gtk.MessageType.ERROR if error else Gtk.MessageType.INFO),
             buttons=Gtk.ButtonsType.OK,
             text=title,
         )
         dialog.format_secondary_text(message)
-        dialog.run()
-        dialog.destroy()
+        self._message_dialogs.append(dialog)
+
+        def close_dialog(current: Gtk.MessageDialog, *_args) -> None:
+            try:
+                self._message_dialogs.remove(current)
+            except ValueError:
+                pass
+            current.destroy()
+
+        def delete_dialog(current: Gtk.MessageDialog, *_args) -> bool:
+            close_dialog(current)
+            return True
+
+        dialog.connect("response", close_dialog)
+        dialog.connect("delete-event", delete_dialog)
+        dialog.show_all()
+        dialog.present()
 
     def open_google_account_settings(
         self, parent: Optional[Gtk.Window] = None
@@ -5637,10 +5779,69 @@ class WorkBreakApp:
                 error=True,
             )
 
+    def _set_google_configure_busy(
+        self, parent: Optional[Gtk.Window], busy: bool, label: str = ""
+    ) -> None:
+        if parent is None:
+            return
+        try:
+            button = getattr(parent, "google_backup_configure", None)
+            if button is None:
+                return
+            button.set_sensitive(not busy)
+            if busy:
+                button.set_label(label or "Ricerca account Google…")
+            else:
+                parent.refresh_backup_ui()
+        except Exception:
+            pass
+
     def configure_google_drive_backup(
         self, parent: Optional[Gtk.Window] = None
     ) -> None:
-        mounts = self._google_drive_mounts()
+        if self._google_drive_discovery_busy or self._google_drive_probe_busy:
+            self._show_backup_message(
+                parent,
+                "Operazione Google Drive in corso",
+                "Attendi il completamento dell’operazione già avviata.",
+            )
+            return
+        self._google_drive_discovery_busy = True
+        self._set_google_configure_busy(parent, True, "Ricerca account Google…")
+
+        def worker() -> None:
+            try:
+                mounts = self._google_drive_mounts()
+                error = ""
+            except Exception as exc:
+                mounts = []
+                error = str(exc)
+            GLib.idle_add(
+                self._finish_google_drive_discovery, parent, mounts, error
+            )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="workbreak-guard-google-discovery",
+        ).start()
+
+    def _finish_google_drive_discovery(
+        self,
+        parent: Optional[Gtk.Window],
+        mounts: list[tuple[str, str]],
+        error: str,
+    ) -> bool:
+        self._google_drive_discovery_busy = False
+        self._set_google_configure_busy(parent, False)
+        if error:
+            self._show_backup_message(
+                parent,
+                "Ricerca Google Drive non riuscita",
+                error,
+                error=True,
+            )
+            return False
         if not mounts:
             self._show_backup_message(
                 parent,
@@ -5653,12 +5854,12 @@ class WorkBreakApp:
                 ),
                 error=True,
             )
-            return
+            return False
 
         if len(mounts) == 1:
             name, uri = mounts[0]
             self._configure_google_drive_account(parent, name, uri)
-            return
+            return False
 
         dialog = Gtk.Dialog(
             title="Scegli l’account Google Drive",
@@ -5681,10 +5882,10 @@ class WorkBreakApp:
         content.pack_start(info, False, False, 0)
         combo = Gtk.ComboBoxText()
         for index, (name, uri) in enumerate(mounts):
-            label = name or "Google Drive"
-            if uri and uri not in label:
-                label = f"{label} — {uri}"
-            combo.append(str(index), label)
+            account_label = name or "Google Drive"
+            if uri and uri not in account_label:
+                account_label = f"{account_label} — {uri}"
+            combo.append(str(index), account_label)
         combo.set_active(0)
         content.pack_start(combo, False, False, 0)
         dialog.show_all()
@@ -5692,12 +5893,13 @@ class WorkBreakApp:
         selected = combo.get_active_id() if response == Gtk.ResponseType.OK else ""
         dialog.destroy()
         if selected is None or selected == "":
-            return
+            return False
         try:
             name, uri = mounts[int(selected)]
         except Exception:
-            return
+            return False
         self._configure_google_drive_account(parent, name, uri)
+        return False
 
     def _configure_google_drive_account(
         self,
@@ -5705,47 +5907,83 @@ class WorkBreakApp:
         account_name: str,
         account_uri: str,
     ) -> None:
-        root = Gio.File.new_for_uri(account_uri)
-        first_error = ""
-        try:
-            info = root.query_info(
-                "standard::display-name,standard::type",
-                Gio.FileQueryInfoFlags.NONE,
-                None,
-            )
-        except Exception as exc:
-            first_error = str(exc)
-            mount_error = self._mount_google_drive_uri(account_uri)
+        if self._google_drive_probe_busy:
+            return
+        self._google_drive_probe_busy = True
+        self._set_google_configure_busy(parent, True, "Verifica account Google…")
+
+        def worker() -> None:
+            display_name = ""
+            error = ""
+            root = Gio.File.new_for_uri(account_uri)
+            first_error = ""
             try:
                 info = root.query_info(
                     "standard::display-name,standard::type",
                     Gio.FileQueryInfoFlags.NONE,
                     None,
                 )
-            except Exception as retry_exc:
-                details = mount_error or str(retry_exc) or first_error
-                self._show_backup_message(
-                    parent,
-                    "Account Google Drive non accessibile",
-                    (
+            except Exception as exc:
+                first_error = str(exc)
+                mount_error = self._mount_google_drive_uri(account_uri)
+                try:
+                    info = root.query_info(
+                        "standard::display-name,standard::type",
+                        Gio.FileQueryInfoFlags.NONE,
+                        None,
+                    )
+                except Exception as retry_exc:
+                    details = mount_error or str(retry_exc) or first_error
+                    error = (
                         "L’account è stato trovato, ma il servizio File non può "
                         "essere montato. Verifica in Account online che File sia "
                         "attivo e che l’account non richieda nuovamente l’accesso. "
                         f"Dettaglio: {details}"
-                    ),
-                    error=True,
-                )
-                return
+                    )
+                    info = None
+            if not error and info is not None:
+                if info.get_file_type() != Gio.FileType.DIRECTORY:
+                    error = (
+                        "La destinazione restituita da GNOME non è una cartella "
+                        "accessibile."
+                    )
+                else:
+                    display_name = str(
+                        info.get_display_name()
+                        or account_name
+                        or "Google Drive"
+                    )
+            GLib.idle_add(
+                self._finish_google_drive_account_probe,
+                parent,
+                account_uri,
+                display_name,
+                error,
+            )
 
-        if info.get_file_type() != Gio.FileType.DIRECTORY:
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="workbreak-guard-google-probe",
+        ).start()
+
+    def _finish_google_drive_account_probe(
+        self,
+        parent: Optional[Gtk.Window],
+        account_uri: str,
+        display_name: str,
+        error: str,
+    ) -> bool:
+        self._google_drive_probe_busy = False
+        self._set_google_configure_busy(parent, False)
+        if error:
             self._show_backup_message(
                 parent,
                 "Account Google Drive non accessibile",
-                "La destinazione restituita da GNOME non è una cartella accessibile.",
+                error,
                 error=True,
             )
-            return
-        display_name = str(info.get_display_name() or account_name or "Google Drive")
+            return False
 
         self._update_persisted_backup_settings(
             google_drive_backup_folder_uri=account_uri,
@@ -5754,10 +5992,13 @@ class WorkBreakApp:
             google_drive_backup_last_error="",
         )
         self._backup_attempted_targets.clear()
+
         def completed(success: bool, message: str) -> None:
             self._show_backup_message(
                 parent,
-                "Backup Google Drive configurato" if success else "Ci sono stati problemi",
+                "Backup Google Drive configurato"
+                if success
+                else "Ci sono stati problemi",
                 message,
                 error=not success,
             )
@@ -5769,6 +6010,7 @@ class WorkBreakApp:
             targets={"google"},
             on_complete=completed,
         )
+        return False
 
     def disconnect_google_drive_backup(
         self, parent: Optional[Gtk.Window] = None
@@ -6533,56 +6775,23 @@ except BaseException as exc:
     ) -> None:
         temp_path: Optional[Path] = None
         try:
-            with tempfile.NamedTemporaryFile(
-                prefix="workbreak-guard-restore-",
-                suffix=".json",
-                delete=False,
-            ) as handle:
-                temp_path = Path(handle.name)
-            self._copy_gio_file_to_local(source, temp_path)
-            payload = self._validate_backup_payload(
-                json.loads(temp_path.read_text(encoding="utf-8"))
-            )
-            created_at = str(payload.get("created_at", "data sconosciuta"))
-            confirm = Gtk.MessageDialog(
-                transient_for=parent,
-                flags=Gtk.DialogFlags.MODAL,
-                message_type=Gtk.MessageType.WARNING,
-                buttons=Gtk.ButtonsType.NONE,
-                text="Ripristinare il backup selezionato?",
-            )
-            confirm.format_secondary_text(
-                f"Origine: {source_label}\n"
-                f"Backup creato: {created_at}\n\n"
-                "Impostazioni, attività e stato salvato verranno sostituiti. "
-                "Prima del ripristino sarà creato automaticamente un backup "
-                "di sicurezza locale."
-            )
-            confirm.add_button("Annulla", Gtk.ResponseType.CANCEL)
-            confirm.add_button("Ripristina", Gtk.ResponseType.OK)
-            confirmed = confirm.run()
-            confirm.destroy()
-            if confirmed != Gtk.ResponseType.OK:
-                return
-            safety_path = self._apply_restored_backup(payload)
-            completed = Gtk.MessageDialog(
-                transient_for=parent,
-                flags=Gtk.DialogFlags.MODAL,
-                message_type=Gtk.MessageType.INFO,
-                buttons=Gtk.ButtonsType.NONE,
-                text="Ripristino completato",
-            )
-            completed.format_secondary_text(
-                "I dati sono stati ripristinati e il timer è stato congelato per "
-                "evitare di sovrascrivere lo stato recuperato.\n\n"
-                f"Backup di sicurezza locale: {safety_path}"
-            )
-            completed.add_button("Riavvierò più tardi", Gtk.ResponseType.CANCEL)
-            completed.add_button("Riavvia ora", Gtk.ResponseType.OK)
-            restart_response = completed.run()
-            completed.destroy()
-            if restart_response == Gtk.ResponseType.OK:
-                self._restart_after_restore()
+            local_path = source.get_path()
+            if local_path:
+                payload = self._validate_backup_payload(
+                    json.loads(Path(local_path).read_text(encoding="utf-8"))
+                )
+            else:
+                with tempfile.NamedTemporaryFile(
+                    prefix="workbreak-guard-restore-",
+                    suffix=".json",
+                    delete=False,
+                ) as handle:
+                    temp_path = Path(handle.name)
+                self._copy_gio_file_to_local(source, temp_path)
+                payload = self._validate_backup_payload(
+                    json.loads(temp_path.read_text(encoding="utf-8"))
+                )
+            self._confirm_and_apply_restore_payload(payload, parent, source_label)
         except Exception as exc:
             self._show_backup_message(
                 parent,
@@ -6637,6 +6846,140 @@ except BaseException as exc:
             selected_path,
         )
 
+    def _set_google_restore_busy(
+        self, parent: Optional[Gtk.Window], busy: bool
+    ) -> None:
+        self._google_restore_busy = busy
+        settings_window = parent if isinstance(parent, SettingsWindow) else None
+        if settings_window is None:
+            settings_window = self.settings_window
+        if settings_window is None:
+            return
+        try:
+            settings_window.google_backup_restore.set_sensitive(not busy)
+            settings_window.google_backup_restore.set_label(
+                "Download backup da Google Drive…"
+                if busy
+                else "Ripristina dal file su Google Drive"
+            )
+        except Exception:
+            pass
+
+    def _google_restore_worker(
+        self,
+        source_uri: str,
+        parent: Optional[Gtk.Window],
+        source_label: str,
+    ) -> None:
+        temp_path: Optional[Path] = None
+        payload: Optional[dict] = None
+        error_text = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="workbreak-guard-restore-",
+                suffix=".json",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+            source = Gio.File.new_for_uri(source_uri)
+            self._copy_gio_file_to_local(source, temp_path)
+            payload = self._validate_backup_payload(
+                json.loads(temp_path.read_text(encoding="utf-8"))
+            )
+        except Exception as exc:
+            error_text = str(exc).strip() or exc.__class__.__name__
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        GLib.idle_add(
+            self._finish_google_restore_worker,
+            parent,
+            source_label,
+            payload,
+            error_text,
+        )
+
+    def _finish_google_restore_worker(
+        self,
+        parent: Optional[Gtk.Window],
+        source_label: str,
+        payload: Optional[dict],
+        error_text: str,
+    ) -> bool:
+        self._set_google_restore_busy(parent, False)
+        if error_text or payload is None:
+            self._show_backup_message(
+                parent,
+                "Backup Google Drive non trovato",
+                (
+                    f"Non riesco a leggere {GOOGLE_DRIVE_BACKUP_FILENAME} "
+                    f"dall’account configurato: {error_text or 'file non valido'}"
+                ),
+                error=True,
+            )
+            return False
+
+        self._confirm_and_apply_restore_payload(payload, parent, source_label)
+        return False
+
+    def _confirm_and_apply_restore_payload(
+        self,
+        payload: dict,
+        parent: Optional[Gtk.Window],
+        source_label: str,
+    ) -> None:
+        try:
+            created_at = str(payload.get("created_at", "data sconosciuta"))
+            confirm = Gtk.MessageDialog(
+                transient_for=parent,
+                flags=Gtk.DialogFlags.MODAL,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Ripristinare il backup selezionato?",
+            )
+            confirm.format_secondary_text(
+                f"Origine: {source_label}\n"
+                f"Backup creato: {created_at}\n\n"
+                "Impostazioni, attività e stato salvato verranno sostituiti. "
+                "Prima del ripristino sarà creato automaticamente un backup "
+                "di sicurezza locale."
+            )
+            confirm.add_button("Annulla", Gtk.ResponseType.CANCEL)
+            confirm.add_button("Ripristina", Gtk.ResponseType.OK)
+            confirmed = confirm.run()
+            confirm.destroy()
+            if confirmed != Gtk.ResponseType.OK:
+                return
+            safety_path = self._apply_restored_backup(payload)
+            completed = Gtk.MessageDialog(
+                transient_for=parent,
+                flags=Gtk.DialogFlags.MODAL,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Ripristino completato",
+            )
+            completed.format_secondary_text(
+                "I dati sono stati ripristinati e il timer è stato congelato per "
+                "evitare di sovrascrivere lo stato recuperato.\n\n"
+                f"Backup di sicurezza locale: {safety_path}"
+            )
+            completed.add_button("Riavvierò più tardi", Gtk.ResponseType.CANCEL)
+            completed.add_button("Riavvia ora", Gtk.ResponseType.OK)
+            restart_response = completed.run()
+            completed.destroy()
+            if restart_response == Gtk.ResponseType.OK:
+                self._restart_after_restore()
+        except Exception as exc:
+            self._show_backup_message(
+                parent,
+                "Ci sono stati problemi",
+                f"Ripristino non riuscito: {exc}",
+                error=True,
+            )
+
     def restore_from_google_drive_backup(
         self, parent: Optional[Gtk.Window] = None
     ) -> None:
@@ -6649,38 +6992,25 @@ except BaseException as exc:
                 error=True,
             )
             return
+        if self._google_restore_busy:
+            return
+
         root = Gio.File.new_for_uri(settings.google_drive_backup_folder_uri)
         source = root.get_child(GOOGLE_DRIVE_BACKUP_FILENAME)
-        try:
-            info = source.query_info(
-                "standard::type,standard::size",
-                Gio.FileQueryInfoFlags.NONE,
-                None,
-            )
-            if info.get_file_type() != Gio.FileType.REGULAR:
-                raise FileNotFoundError(
-                    f"{GOOGLE_DRIVE_BACKUP_FILENAME} non è un file valido"
-                )
-        except Exception as exc:
-            self._show_backup_message(
-                parent,
-                "Backup Google Drive non trovato",
-                (
-                    f"Non riesco a leggere {GOOGLE_DRIVE_BACKUP_FILENAME} "
-                    f"dall’account configurato: {exc}"
-                ),
-                error=True,
-            )
-            return
         account = (
             settings.google_drive_backup_folder_name
             or settings.google_drive_backup_folder_uri
         )
-        self._restore_from_gio_source(
-            source,
-            parent,
-            f"Google Drive — {account}/{GOOGLE_DRIVE_BACKUP_FILENAME}",
+        source_label = (
+            f"Google Drive — {account}/{GOOGLE_DRIVE_BACKUP_FILENAME}"
         )
+        self._set_google_restore_busy(parent, True)
+        threading.Thread(
+            target=self._google_restore_worker,
+            args=(source.get_uri(), parent, source_label),
+            daemon=True,
+            name="wbg-google-restore",
+        ).start()
 
     def restore_from_google_drive(
         self, parent: Optional[Gtk.Window] = None
@@ -7712,7 +8042,10 @@ except BaseException as exc:
             self.clock.hide()
             self._update_ui()
             return True
-        self._ensure_due_balance_settlements(now.date())
+        now_mono = time.monotonic()
+        if now_mono >= self._next_balance_maintenance_monotonic:
+            self._next_balance_maintenance_monotonic = now_mono + 60.0
+            self._ensure_due_balance_settlements(now.date())
         self._check_scheduled_backup(now)
 
         if self.slack_call_tracking_active:
@@ -9498,8 +9831,18 @@ except BaseException as exc:
 
     def _touch_stats(self) -> None:
         self.stats_save_counter += 1
-        if self.stats_save_counter >= 30:
-            self._save_activity_log()
+        if self.stats_save_counter >= 30 and not self._activity_save_idle_id:
+            # La serializzazione dello storico può diventare costosa dopo mesi
+            # di utilizzo. Eseguirla come idle evita che parta nel mezzo di uno
+            # scroll, di un clic o della digitazione in una finestra.
+            self._activity_save_idle_id = GLib.idle_add(
+                self._save_activity_log_idle
+            )
+
+    def _save_activity_log_idle(self) -> bool:
+        self._activity_save_idle_id = 0
+        self._save_activity_log()
+        return False
 
     def _record_work_second(self, day: dt.date, overtime: bool = False) -> None:
         self._record_work_seconds(day, 1, overtime=overtime)
@@ -9544,8 +9887,6 @@ except BaseException as exc:
             self._touch_stats()
         else:
             self._save_activity_log()
-        if self.summary_window and self.summary_window.get_visible() and self.stats_save_counter % 5 == 0:
-            self.summary_window.refresh()
 
     def _record_break_second(self, day: dt.date, credited: bool = False) -> int:
         return self._record_break_seconds(day, 1, credited=credited)
@@ -9579,8 +9920,6 @@ except BaseException as exc:
             self._touch_stats()
         else:
             self._save_activity_log()
-        if self.summary_window and self.summary_window.get_visible() and self.stats_save_counter % 5 == 0:
-            self.summary_window.refresh()
         return max(0, after_credit - before_credit)
 
     def _remember_project(self, project: str) -> None:
@@ -10559,21 +10898,31 @@ except BaseException as exc:
             base = format_compact_time(self.work_remaining)
 
         today = dt.date.today()
-        stats = self.activity_log.get("days", {}).get(today.isoformat(), {})
-        if self._is_special_workday(today, stats):
-            special = self.special_day_extra_seconds(today)
-            if special > 0:
-                return f"{base} · EXTRA {format_compact_time(special)}"
-            return base
-        if self.day_has_regular_target(today):
-            remaining = self.daily_remaining_seconds(today)
-            if remaining > 0:
-                return f"{base} · {format_compact_time(remaining)} da fare"
-            balance = self.projected_time_balance_for_day_seconds(today)
-            if balance > 0:
-                return f"{base} · saldo {format_signed_hours_minutes(balance)}"
-            return f"{base} · giornata ✓"
-        return base
+        now_mono = time.monotonic()
+        if (
+            self._cached_indicator_suffix_day != today
+            or now_mono >= self._next_indicator_suffix_refresh_monotonic
+        ):
+            suffix = ""
+            stats = self.activity_log.get("days", {}).get(today.isoformat(), {})
+            if self._is_special_workday(today, stats):
+                special = self.special_day_extra_seconds(today)
+                if special > 0:
+                    suffix = f" · EXTRA {format_compact_time(special)}"
+            elif self.day_has_regular_target(today):
+                remaining = self.daily_remaining_seconds(today)
+                if remaining > 0:
+                    suffix = f" · {format_compact_time(remaining)} da fare"
+                else:
+                    balance = self.projected_time_balance_for_day_seconds(today)
+                    if balance > 0:
+                        suffix = f" · saldo {format_signed_hours_minutes(balance)}"
+                    else:
+                        suffix = " · giornata ✓"
+            self._cached_indicator_suffix_day = today
+            self._cached_indicator_suffix = suffix
+            self._next_indicator_suffix_refresh_monotonic = now_mono + 5.0
+        return base + self._cached_indicator_suffix
 
     def _update_indicator_label(self) -> None:
         if self.indicator is None:
@@ -10721,7 +11070,16 @@ except BaseException as exc:
 
     def _update_ui(self) -> None:
         text = self.status_text()
-        progress = self.daily_progress_text(dt.date.today())
+        today = dt.date.today()
+        now_mono = time.monotonic()
+        if (
+            self._cached_daily_progress_day != today
+            or now_mono >= self._next_daily_progress_refresh_monotonic
+        ):
+            self._cached_daily_progress_day = today
+            self._cached_daily_progress_text = self.daily_progress_text(today)
+            self._next_daily_progress_refresh_monotonic = now_mono + 5.0
+        progress = self._cached_daily_progress_text
         if progress:
             text = f"{text}\n{progress}"
         self._update_indicator_label()
@@ -10740,7 +11098,14 @@ except BaseException as exc:
                 pass
 
     def quit(self) -> None:
+        self._ui_watchdog_stop.set()
         self._stop_slack_notification_monitor()
+        for dialog in list(self._message_dialogs):
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+        self._message_dialogs.clear()
         if self.slack_call_tracking_active:
             # In chiusura non lasciare attività temporanee: consolida la chiamata
             # con il nome generico, perché la finestra descrizione non potrebbe
