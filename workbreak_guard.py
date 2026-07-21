@@ -98,6 +98,7 @@ AUTOSTART_DIR = Path.home() / ".config" / "autostart"
 AUTOSTART_FILE = AUTOSTART_DIR / f"{APP_ID}.desktop"
 SESSION_END_INACTIVITY_SECONDS = 20 * 60
 REGULAR_PAUSE_WORK_BLOCK_SECONDS = 2 * 60 * 60
+POST_CALL_PAUSE_PROMPT_DELAY_SECONDS = 30
 
 TIMER_END_SOUND_OPTIONS = {
     "none": "Nessun suono",
@@ -1127,10 +1128,17 @@ class RegularPauseWindow(Gtk.Window):
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         actions.set_homogeneous(True)
         outer.pack_start(actions, False, False, 0)
-        skip = Gtk.Button(label="Salta pausa e continua il lavoro")
-        skip.connect("clicked", lambda *_: self._skip())
-        actions.pack_start(skip, True, True, 0)
-        cancel = Gtk.Button(label="Annulla")
+        if not app.required_pause_after_call:
+            skip = Gtk.Button(label="Salta pausa e continua il lavoro")
+            skip.connect("clicked", lambda *_: self._skip())
+            actions.pack_start(skip, True, True, 0)
+        cancel = Gtk.Button(
+            label=(
+                "Torna all’avviso"
+                if app.required_pause_after_call
+                else "Annulla"
+            )
+        )
         cancel.connect("clicked", lambda *_: self._cancel())
         actions.pack_start(cancel, True, True, 0)
 
@@ -4125,6 +4133,14 @@ class WorkBreakApp:
         self._slack_notification_monitor_process: Optional[subprocess.Popen] = None
         self._slack_notification_monitor_stop = threading.Event()
         self._slack_notification_monitor_last_start = 0.0
+        # La chiamata resta lavoro: il ciclo verso la pausa continua, ma gli
+        # avvisi vengono trattenuti fino alla conferma della descrizione e per
+        # altri 30 secondi. Se la pausa scade nel frattempo diventa obbligatoria.
+        self.call_cycle_hold_active = False
+        self.call_pause_due_at: Optional[dt.datetime] = None
+        self.call_pause_prompt_timeout_id = 0
+        self.required_pause_after_call = False
+        self.call_interrupted_break = False
 
         self._setup_indicator_or_control()
         self._restore_latest_activity()
@@ -5034,6 +5050,174 @@ print("0")
         self.slack_call_prompt_window = None
         self.slack_call_prompted_for_presence = True
 
+    def _cancel_post_call_pause_timeout(self) -> None:
+        timeout_id = int(getattr(self, "call_pause_prompt_timeout_id", 0) or 0)
+        if timeout_id:
+            try:
+                GLib.source_remove(timeout_id)
+            except Exception:
+                pass
+        self.call_pause_prompt_timeout_id = 0
+
+    def _destroy_deferred_pause_windows(self) -> None:
+        for attr in (
+            "grace_choice_window",
+            "stop_window",
+            "regular_pause_window",
+            "return_window",
+        ):
+            window = getattr(self, attr, None)
+            try:
+                if window:
+                    window.destroy()
+            except Exception:
+                pass
+            setattr(self, attr, None)
+
+    def _call_pause_overdue_seconds(self, now: Optional[dt.datetime] = None) -> int:
+        if self.call_pause_due_at is None:
+            return 0
+        current = now or dt.datetime.now()
+        return max(0, int((current - self.call_pause_due_at).total_seconds()))
+
+    def _mark_pause_due_during_call(self, now: Optional[dt.datetime] = None) -> None:
+        current = now or dt.datetime.now()
+        if self.call_pause_due_at is None:
+            self.call_pause_due_at = current
+        self.required_pause_after_call = True
+        self.work_remaining = 0
+        self.grace_remaining = 0
+        self.in_grace = False
+        self.waiting_grace_choice = False
+        self.waiting_break_start = False
+        self.regular_pause_origin = "stop"
+        self._destroy_deferred_pause_windows()
+
+    def _prepare_call_cycle_hold(self, now: dt.datetime) -> None:
+        self._cancel_post_call_pause_timeout()
+        self.call_cycle_hold_active = True
+        self.call_interrupted_break = bool(self.in_break)
+
+        # Una chiamata è lavoro, quindi non può soddisfare una pausa già dovuta.
+        # Le vecchie finestre vengono chiuse per impedire che la pausa venga
+        # saltata o azzerata mentre la chiamata è in corso.
+        if self.waiting_grace_choice or self.waiting_break_start:
+            self._mark_pause_due_during_call(now)
+        elif self.in_grace and self.grace_remaining <= 0:
+            self._mark_pause_due_during_call(now)
+        elif self.required_pause_after_call:
+            self._destroy_deferred_pause_windows()
+        elif self.in_break or self.waiting_return:
+            # La pausa eventualmente già avviata viene semplicemente sospesa:
+            # nessun secondo di chiamata viene registrato come pausa.
+            self._destroy_deferred_pause_windows()
+
+    def _advance_cycle_during_call(self, now: dt.datetime) -> None:
+        """Fa avanzare il ciclo lavorativo senza aprire modali durante la chiamata."""
+        if (
+            not self.settings.enabled
+            or self.current_session is None
+            or self.day_suspended
+            or self.waiting_session_start
+            or self.waiting_session_end
+            or self.in_overtime
+            or self.in_midday_recovery
+            or self.waiting_daily_close_choice
+            or self.compensating_daily_balance
+            or self.in_break
+            or self.waiting_return
+            or self.manual_break
+            or self.required_pause_after_call
+        ):
+            return
+
+        if self.waiting_grace_choice or self.waiting_break_start:
+            self._mark_pause_due_during_call(now)
+            return
+
+        if self.in_grace:
+            self.grace_remaining = max(0, self.grace_remaining - 1)
+            if self.grace_remaining <= 0:
+                self._mark_pause_due_during_call(now)
+            return
+
+        self.work_remaining = max(0, self.work_remaining - 1)
+        if self.work_remaining <= 0:
+            self._mark_pause_due_during_call(now)
+
+    def _schedule_post_call_pause_resolution(self) -> None:
+        self._cancel_post_call_pause_timeout()
+        if self.required_pause_after_call:
+            self.call_cycle_hold_active = True
+            self.call_pause_prompt_timeout_id = GLib.timeout_add_seconds(
+                POST_CALL_PAUSE_PROMPT_DELAY_SECONDS,
+                self._release_cycle_after_call,
+            )
+        else:
+            # Se la pausa non è ancora scaduta, il ciclo riprende subito dopo
+            # la conferma della descrizione. Il ritardo di 30 secondi serve solo
+            # per l'avviso della pausa diventata obbligatoria durante la chiamata.
+            self.call_cycle_hold_active = False
+            if self.call_interrupted_break:
+                self.call_interrupted_break = False
+            elif self.waiting_return:
+                self._show_return_activity_prompt()
+        self._save_runtime_state(force=True)
+        self._update_ui()
+
+    def _release_cycle_after_call(self) -> bool:
+        self.call_pause_prompt_timeout_id = 0
+        if self.slack_call_tracking_active:
+            # Una nuova chiamata è partita prima della scadenza: sarà la sua
+            # conferma finale a programmare nuovamente il rilascio.
+            return False
+
+        self.call_cycle_hold_active = False
+        if self.required_pause_after_call:
+            self._show_required_pause_after_call()
+        elif self.call_interrupted_break:
+            # Riprende esattamente dal residuo precedente: il tempo della
+            # chiamata e della descrizione non viene conteggiato come pausa.
+            self.call_interrupted_break = False
+        elif self.waiting_return:
+            self._show_return_activity_prompt()
+        self._save_runtime_state(force=True)
+        self._update_ui()
+        return False
+
+    def _show_required_pause_after_call(self, restoring: bool = False) -> None:
+        if self.call_cycle_hold_active or self.slack_call_tracking_active:
+            return
+        self.required_pause_after_call = True
+        self.waiting_grace_choice = False
+        self.in_grace = False
+        self.grace_remaining = 0
+        self.waiting_break_start = True
+        self.work_remaining = 0
+        self.regular_pause_origin = "stop"
+        overdue = self._call_pause_overdue_seconds()
+
+        if self.stop_window and self.stop_window.get_visible():
+            self.stop_window.present()
+            return
+        self.stop_window = ChoiceAlertWindow(
+            "Pausa rimandata dalla chiamata",
+            (
+                f"La pausa è scaduta da {format_hhmmss(overdue)}. "
+                "La chiamata è tempo di lavoro: non sostituisce, non salta e "
+                "non azzera la pausa. Puoi iniziarla a partire da questo momento."
+            ),
+            [
+                (
+                    "Scegli durata pausa",
+                    lambda: self._request_regular_pause_duration("stop"),
+                )
+            ],
+        )
+        if not restoring:
+            self._play_timer_end_sound()
+        self._save_runtime_state(force=True)
+
     def _start_manual_call_tracking(self) -> None:
         if self.slack_call_tracking_active:
             return
@@ -5052,6 +5236,7 @@ print("0")
         if self.slack_call_tracking_active:
             return
         now = dt.datetime.now()
+        self._prepare_call_cycle_hold(now)
         self.slack_call_tracking_active = True
         self.slack_call_manual_mode = bool(manual_mode)
         self.slack_call_end_missing_since = None
@@ -5298,6 +5483,7 @@ print("0")
 
         self._remember_project(project)
         self._save_activity_log()
+        self._schedule_post_call_pause_resolution()
         if self.summary_window and self.summary_window.get_visible():
             self.summary_window.refresh()
         self._update_ui()
@@ -7671,6 +7857,11 @@ except BaseException as exc:
         self.day_suspended = False
         self.resume_preserves_cycle = False
         self.pending_manual_session = None
+        self._cancel_post_call_pause_timeout()
+        self.call_cycle_hold_active = False
+        self.call_pause_due_at = None
+        self.required_pause_after_call = False
+        self.call_interrupted_break = False
         for window in [
             self.warning_window,
             self.grace_choice_window,
@@ -7710,6 +7901,8 @@ except BaseException as exc:
     def _runtime_phase(self) -> str:
         if self.day_suspended:
             return "day_suspended"
+        if self.required_pause_after_call:
+            return "waiting_break_start"
         if self.compensating_daily_balance:
             return "daily_compensation"
         if self.waiting_daily_close_choice:
@@ -7738,7 +7931,7 @@ except BaseException as exc:
         if self.current_session is None or self.current_session_date is None:
             return None
         return {
-            "schema_version": 8,
+            "schema_version": 9,
             "reminders_paused": not self.settings.enabled,
             "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
             "session": self.current_session,
@@ -7774,6 +7967,12 @@ except BaseException as exc:
             "manual_open_ended_work": bool(self.manual_open_ended_work),
             "day_suspended": bool(self.day_suspended),
             "resume_preserves_cycle": bool(self.resume_preserves_cycle),
+            "required_pause_after_call": bool(self.required_pause_after_call),
+            "call_pause_due_at": (
+                self.call_pause_due_at.isoformat(timespec="seconds")
+                if self.call_pause_due_at
+                else ""
+            ),
             "activity": self.current_activity,
             "project": self.current_project,
         }
@@ -7826,7 +8025,7 @@ except BaseException as exc:
         except Exception:
             self._clear_runtime_state()
             return False
-        if not isinstance(raw, dict) or int(raw.get("schema_version", 0)) not in (1, 2, 3, 4, 5, 6, 7, 8):
+        if not isinstance(raw, dict) or int(raw.get("schema_version", 0)) not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
             self._clear_runtime_state()
             return False
 
@@ -7979,6 +8178,16 @@ except BaseException as exc:
         self.manual_open_ended_work = bool(raw.get("manual_open_ended_work", False))
         self.day_suspended = bool(raw.get("day_suspended", phase == "day_suspended"))
         self.resume_preserves_cycle = restored_preserved_cycle
+        self.required_pause_after_call = bool(
+            raw.get("required_pause_after_call", False)
+        )
+        try:
+            due_text = str(raw.get("call_pause_due_at", "")).strip()
+            self.call_pause_due_at = (
+                dt.datetime.fromisoformat(due_text) if due_text else None
+            )
+        except Exception:
+            self.call_pause_due_at = None
 
         self.waiting_session_start = phase == "waiting_session_start"
         self.waiting_grace_choice = phase == "waiting_grace_choice"
@@ -7991,6 +8200,16 @@ except BaseException as exc:
         self.in_midday_recovery = phase == "midday_recovery"
         self.waiting_daily_close_choice = phase == "waiting_daily_close_choice"
         self.compensating_daily_balance = phase == "daily_compensation"
+        self.call_cycle_hold_active = False
+        self.call_interrupted_break = False
+        if self.required_pause_after_call:
+            self.work_remaining = 0
+            self.grace_remaining = 0
+            self.in_grace = False
+            self.waiting_grace_choice = False
+            self.in_break = False
+            self.waiting_return = False
+            self.waiting_break_start = True
         self._cap_work_cycle_to_session_end(now)
         self._save_runtime_state(force=True)
         return True
@@ -8013,7 +8232,10 @@ except BaseException as exc:
         elif self.waiting_grace_choice:
             self._show_grace_choice(restoring=True)
         elif self.waiting_break_start:
-            self._show_stop_alert(restoring=True)
+            if self.required_pause_after_call:
+                self._show_required_pause_after_call(restoring=True)
+            else:
+                self._show_stop_alert(restoring=True)
         elif self.waiting_return:
             self._show_return_activity_prompt()
         return False
@@ -8048,12 +8270,17 @@ except BaseException as exc:
             self._ensure_due_balance_settlements(now.date())
         self._check_scheduled_backup(now)
 
-        if self.slack_call_tracking_active:
-            # La chiamata usa un timer separato e congela esattamente la fase
-            # precedente. La retention serve solo a confermare la chiusura e non
-            # viene sommata al tempo registrato.
-            if self.slack_call_end_missing_since is None:
+        if self.slack_call_tracking_active or self.call_cycle_hold_active:
+            # Durante la chiamata il ciclo verso la pausa continua: la chiamata è
+            # lavoro, non pausa. Quando il residuo arriva a zero resta bloccato e
+            # l'avviso viene rinviato fino a 30 secondi dopo la conferma della
+            # descrizione. Durante descrizione e ritardo lo stato resta sospeso.
+            if (
+                self.slack_call_tracking_active
+                and self.slack_call_end_missing_since is None
+            ):
                 self._record_slack_call_independent_second(now.date())
+                self._advance_cycle_during_call(now)
             self.clock.hide()
             self._save_runtime_state()
             self._update_ui()
@@ -8875,6 +9102,9 @@ except BaseException as exc:
         self._request_regular_pause_duration("grace")
 
     def _show_stop_alert(self, immediate: bool = False, restoring: bool = False) -> None:
+        if self.required_pause_after_call:
+            self._show_required_pause_after_call(restoring=restoring)
+            return
         self.in_grace = False
         self.waiting_grace_choice = False
         self.waiting_break_start = True
@@ -8919,6 +9149,13 @@ except BaseException as exc:
     def _cancel_regular_pause_choice(self) -> bool:
         origin = self.regular_pause_origin
         self.regular_pause_origin = "stop"
+        if self.required_pause_after_call:
+            self.waiting_grace_choice = False
+            self.waiting_break_start = True
+            self._show_required_pause_after_call(restoring=True)
+            self._save_runtime_state(force=True)
+            self._update_ui()
+            return False
         if origin == "grace":
             self.waiting_grace_choice = True
             self.waiting_break_start = False
@@ -8933,6 +9170,9 @@ except BaseException as exc:
 
     def _skip_regular_break(self) -> None:
         """Ignora la pausa ciclica e avvia subito un nuovo blocco di lavoro."""
+        if self.required_pause_after_call:
+            self._show_required_pause_after_call(restoring=True)
+            return
         for attr in ("grace_choice_window", "stop_window", "regular_pause_window"):
             window = getattr(self, attr, None)
             try:
@@ -8962,6 +9202,11 @@ except BaseException as exc:
 
     def _begin_regular_break(self, minutes: int) -> None:
         # La pausa parte solo dopo la scelta esplicita della durata.
+        self.required_pause_after_call = False
+        self.call_pause_due_at = None
+        self.call_interrupted_break = False
+        self.call_cycle_hold_active = False
+        self._cancel_post_call_pause_timeout()
         self.waiting_grace_choice = False
         self.waiting_break_start = False
         self.in_grace = False
@@ -10858,7 +11103,24 @@ except BaseException as exc:
                 max(0, int(value))
                 for value in self.slack_call_allocations.values()
             )
-            return f"☎ {format_compact_time(elapsed)}"
+            if self.required_pause_after_call:
+                pause_state = (
+                    f"pausa +{format_compact_time(self._call_pause_overdue_seconds())}"
+                )
+            elif self.in_break:
+                pause_state = f"pausa sospesa {format_compact_time(self.break_remaining)}"
+            elif self.in_grace:
+                pause_state = f"pausa tra {format_compact_time(self.grace_remaining)}"
+            else:
+                pause_state = f"pausa tra {format_compact_time(self.work_remaining)}"
+            return f"☎ {format_compact_time(elapsed)} · {pause_state}"
+        if self.call_cycle_hold_active:
+            if self.required_pause_after_call:
+                return (
+                    "☎ chiusura · pausa +"
+                    f"{format_compact_time(self._call_pause_overdue_seconds())}"
+                )
+            return "☎ chiusura chiamata"
         if not self.settings.enabled:
             return "OFF"
         elif self.day_suspended:
@@ -10981,9 +11243,39 @@ except BaseException as exc:
                     else self.current_activity
                 )
                 previous = f" — poi riprende: {previous_name}"
+            if self.required_pause_after_call:
+                pause_state = (
+                    " — pausa scaduta da "
+                    f"{format_hhmmss(self._call_pause_overdue_seconds())}"
+                )
+            elif self.in_break:
+                pause_state = (
+                    " — pausa sospesa, residuo "
+                    f"{format_hhmmss(self.break_remaining)}"
+                )
+            elif self.in_grace:
+                pause_state = (
+                    " — pausa tra "
+                    f"{format_hhmmss(self.grace_remaining)}"
+                )
+            else:
+                pause_state = (
+                    " — pausa tra "
+                    f"{format_hhmmss(self.work_remaining)}"
+                )
             return (
                 f"{call_title}{caller} · {project} · {format_hhmmss(elapsed)}"
-                f"{retention}{previous}"
+                f"{retention}{pause_state}{previous}"
+            )
+        if self.call_cycle_hold_active:
+            if self.required_pause_after_call:
+                return (
+                    "Chiamata conclusa: attendo la descrizione o il ritardo di 30 secondi. "
+                    "La pausa è scaduta da "
+                    f"{format_hhmmss(self._call_pause_overdue_seconds())}."
+                )
+            return (
+                "Chiamata conclusa: attendo la descrizione prima di riprendere il timer."
             )
         if not self.settings.enabled:
             return "Promemoria disattivato — timer congelato"
